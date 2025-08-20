@@ -1,3 +1,5 @@
+@'
+from __future__ import annotations
 """
 Бот розыгрыша с кодовыми словами.
 """
@@ -17,8 +19,7 @@ from aiogram.filters import Command
 from aiogram.types import BotCommand, BufferedInputFile
 
 from aiohttp import web
-# ВАЖНО: SimpleRequestHandler больше не используем
-from aiogram.webhook.aiohttp_server import setup_application
+from aiogram.webhook.aiohttp_server import setup_application  # без SimpleRequestHandler
 
 import aiosqlite
 import config
@@ -381,3 +382,4 @@ if __name__ == "__main__":
             asyncio.run(_run_polling())
         except (KeyboardInterrupt, SystemExit):
             logger.info("Бот остановлен")
+'@ | Set-Content -Encoding UTF8 bot.py
