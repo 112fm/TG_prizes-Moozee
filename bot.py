@@ -53,7 +53,7 @@ def make_participant_code() -> str:
     return "".join(secrets.choice(ALPHABET) for _ in range(PART_LEN))
 
 def is_admin(user_id: int) -> bool:
-    return user_id in set(config.ADMIN_IDS or [])
+    return user_id in set(getattr(config, "ADMIN_IDS", []) or [])
 
 # ---------- ИНИТ БД + МИГРАЦИИ ----------
 async def init_db() -> None:
@@ -84,7 +84,7 @@ async def init_db() -> None:
             );
             """
         )
-        # Уникальность пары (user_id, code) — чтобы не дублировать один код
+        # Уникальность пары (user_id, code)
         await db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_entries_user_code ON entries(user_id, code);")
         await db.commit()
     logger.info("База данных и таблицы готовы к работе.")
@@ -102,40 +102,35 @@ async def set_bot_commands() -> None:
 
 # ---------- ЛОГИКА ----------
 async def ensure_user(db, user_id: int, username: str | None, first_name: str | None) -> str:
-    """Убедиться, что пользователь есть в users и имеет постоянный participant_code. Вернёт participant_code."""
     cur = await db.execute("SELECT participant_code FROM users WHERE user_id = ?", (user_id,))
     row = await cur.fetchone()
     if row:
-        await db.execute("UPDATE users SET username = ?, first_name = ? WHERE user_id = ?",
-                         (username or "", first_name or "", user_id))
+        await db.execute(
+            "UPDATE users SET username = ?, first_name = ? WHERE user_id = ?",
+            (username or "", first_name or "", user_id),
+        )
         return row[0]
-    # Генерация уникального participant_code
     while True:
         pc = make_participant_code()
         cur2 = await db.execute("SELECT 1 FROM users WHERE participant_code = ?", (pc,))
         if not await cur2.fetchone():
             break
-    await db.execute("INSERT INTO users (user_id, username, first_name, participant_code) VALUES (?, ?, ?, ?)",
-                     (user_id, username or "", first_name or "", pc))
+    await db.execute(
+        "INSERT INTO users (user_id, username, first_name, participant_code) VALUES (?, ?, ?, ?)",
+        (user_id, username or "", first_name or "", pc),
+    )
     return pc
 
 async def register_entry(user_id: int, username: str | None, first_name: str | None, code: str) -> tuple[int, bool, str]:
-    """
-    Зарегистрировать код для пользователя.
-    Возвращает (entry_number, is_new, participant_code)
-    is_new=False — если этот код уже был у пользователя.
-    """
     async with aiosqlite.connect(DB_NAME) as db:
         participant_code = await ensure_user(db, user_id, username, first_name)
 
-        # Уже есть такой код у пользователя?
         cur = await db.execute("SELECT entry_number FROM entries WHERE user_id = ? AND code = ?", (user_id, code))
         row = await cur.fetchone()
         if row:
             await db.commit()
             return row[0], False, participant_code
 
-        # Новый код → общий порядковый номер
         cur = await db.execute("SELECT MAX(entry_number) FROM entries")
         max_number = (await cur.fetchone())[0] or 0
         new_number = max_number + 1
@@ -150,7 +145,6 @@ async def register_entry(user_id: int, username: str | None, first_name: str | N
         return new_number, True, participant_code
 
 async def get_user_entries(user_id: int) -> tuple[str, list[tuple[str,int]]]:
-    """Вернёт (participant_code, [(code, entry_number), ...])"""
     async with aiosqlite.connect(DB_NAME) as db:
         cur = await db.execute("SELECT participant_code FROM users WHERE user_id = ?", (user_id,))
         row = await cur.fetchone()
@@ -164,8 +158,7 @@ async def get_user_entries(user_id: int) -> tuple[str, list[tuple[str,int]]]:
 async def export_csv() -> bytes:
     async with aiosqlite.connect(DB_NAME) as db:
         cur = await db.execute(
-            "SELECT e.user_id, e.username, e.code, e.entry_number "
-            "FROM entries e ORDER BY e.id"
+            "SELECT e.user_id, e.username, e.code, e.entry_number FROM entries e ORDER BY e.id"
         )
         rows = await cur.fetchall()
     buff = StringIO()
@@ -176,10 +169,6 @@ async def export_csv() -> bytes:
     return buff.getvalue().encode("utf-8")
 
 async def draw_weighted_winner() -> dict | None:
-    """
-    Взвешенный победитель: для каждого пользователя число «билетов» = кол-ву уникальных кодов (1..3).
-    Суммируем билеты и выбираем случайно по весам.
-    """
     async with aiosqlite.connect(DB_NAME) as db:
         cur = await db.execute(
             "SELECT u.user_id, u.username, u.first_name, u.participant_code, COUNT(DISTINCT e.code) AS codes_count "
@@ -193,7 +182,6 @@ async def draw_weighted_winner() -> dict | None:
     if not users:
         return None
 
-    from collections import defaultdict
     codes_by_user = defaultdict(list)
     for uid, code in code_rows:
         codes_by_user[uid].append(code)
@@ -215,7 +203,6 @@ async def draw_weighted_winner() -> dict | None:
     if not pool:
         return None
 
-    # Взвешенный выбор
     weights = [p["codes_count"] for p in pool]
     total = sum(weights)
     r = random.uniform(0, total)
@@ -285,7 +272,7 @@ async def cmd_draw(message: types.Message) -> None:
     )
     await message.answer(text, parse_mode="Markdown")
 
-    if config.GROUP_CHAT_ID:
+    if getattr(config, "GROUP_CHAT_ID", None):
         try:
             await bot.send_message(config.GROUP_CHAT_ID, text, parse_mode="Markdown")
         except Exception as e:
@@ -368,7 +355,8 @@ def create_app() -> web.Application:
     app.router.add_get("/health", health)
     handler = SimpleRequestHandler(dispatcher=dp, bot=bot, secret_token=WEBHOOK_SECRET)
     handler.register(app, path=WEBHOOK_PATH)
-    setup_application(app, on_startup=[_on_startup], on_shutdown=[_on_shutdown])
+    # >>> КЛЮЧЕВАЯ ПРАВКА: передаём dispatcher (и bot) <<<
+    setup_application(app, dp, bot=bot, on_startup=[_on_startup], on_shutdown=[_on_shutdown])
     return app
 
 async def _run_polling():
