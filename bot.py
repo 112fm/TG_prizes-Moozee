@@ -1,5 +1,3 @@
-@'
-from __future__ import annotations
 """
 Бот розыгрыша с кодовыми словами.
 """
@@ -353,6 +351,9 @@ def create_app() -> web.Application:
             return web.Response(status=400, text="bad json")
 
         try:
+            # гарантируем что БД/таблицы созданы ПЕРЕД обработкой апдейта
+            await init_db()
+
             update = types.Update.model_validate(data)
             await dp.feed_update(bot, update)
         except Exception as e:
@@ -382,4 +383,3 @@ if __name__ == "__main__":
             asyncio.run(_run_polling())
         except (KeyboardInterrupt, SystemExit):
             logger.info("Бот остановлен")
-'@ | Set-Content -Encoding UTF8 bot.py
