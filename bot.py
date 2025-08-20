@@ -1,18 +1,5 @@
 """
 Бот розыгрыша с кодовыми словами.
-Фичи:
-- Постоянный буквенно‑цифровой ID игрока (например, 8uRgga), один раз и навсегда.
-- Проверка кодов по списку, запись в БД.
-- Взвешенный розыгрыш: шанс = числу уникально найденных кодов (1..3).
-- Вебхук для Render (если задан WEBHOOK_URL), иначе локальный polling.
-- Опциональный анонс победителя в группу (GROUP_CHAT_ID).
-
-Команды:
-  /start — приветствие и инструкция.
-  /my    — показать свои коды и свой постоянный ID.
-  /export (админ) — CSV (user_id, username, code, entry_number).
-  /draw   (админ) — случайный победитель (взвешенно).
-  /stats  (админ) — статистика.
 """
 
 import os
@@ -30,7 +17,8 @@ from aiogram.filters import Command
 from aiogram.types import BotCommand, BufferedInputFile
 
 from aiohttp import web
-from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
+# ВАЖНО: SimpleRequestHandler больше не используем
+from aiogram.webhook.aiohttp_server import setup_application
 
 import aiosqlite
 import config
@@ -58,7 +46,6 @@ def is_admin(user_id: int) -> bool:
 # ---------- ИНИТ БД + МИГРАЦИИ ----------
 async def init_db() -> None:
     async with aiosqlite.connect(DB_NAME) as db:
-        # Таблица пользователей со стабильным кодом участника
         await db.execute(
             """
             CREATE TABLE IF NOT EXISTS users (
@@ -69,7 +56,6 @@ async def init_db() -> None:
             );
             """
         )
-        # Таблица заявок (как была)
         await db.execute(
             """
             CREATE TABLE IF NOT EXISTS entries (
@@ -84,7 +70,6 @@ async def init_db() -> None:
             );
             """
         )
-        # Уникальность пары (user_id, code)
         await db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_entries_user_code ON entries(user_id, code);")
         await db.commit()
     logger.info("База данных и таблицы готовы к работе.")
@@ -329,7 +314,7 @@ async def handle_code(message: types.Message) -> None:
 
 # ---------- ЗАПУСК: WEBHOOK или POLLING ----------
 WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/webhook")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # напр.: https://<app>.onrender.com/webhook
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # https://<app>.onrender.com/webhook
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "change-me")
 PORT = int(os.getenv("PORT", "10000"))
 
@@ -351,11 +336,33 @@ async def _on_shutdown(app: web.Application):
 
 def create_app() -> web.Application:
     app = web.Application()
-    async def health(_): return web.Response(text="ok")
+
+    # healthcheck
+    async def health(_):
+        return web.Response(text="ok")
     app.router.add_get("/health", health)
-    handler = SimpleRequestHandler(dispatcher=dp, bot=bot, secret_token=WEBHOOK_SECRET)
-    handler.register(app, path=WEBHOOK_PATH)
-    # >>> КЛЮЧЕВАЯ ПРАВКА: передаём dispatcher (и bot) <<<
+
+    # ЯВНЫЙ обработчик Telegram webhook + проверка секрета
+    async def telegram_webhook(request: web.Request) -> web.Response:
+        if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != WEBHOOK_SECRET:
+            return web.Response(status=403, text="forbidden")
+        try:
+            data = await request.json()
+        except Exception:
+            return web.Response(status=400, text="bad json")
+
+        try:
+            update = types.Update.model_validate(data)
+            await dp.feed_update(bot, update)
+        except Exception as e:
+            logger.exception("Ошибка обработки webhook: %s", e)
+            return web.Response(text="ok")
+
+        return web.Response(text="ok")
+
+    app.router.add_post(WEBHOOK_PATH, telegram_webhook)
+
+    # регистрация хуков старта/остановки
     setup_application(app, dp, bot=bot, on_startup=[_on_startup], on_shutdown=[_on_shutdown])
     return app
 
