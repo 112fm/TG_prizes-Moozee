@@ -3,8 +3,7 @@ import os
 # 🔑 Секреты из переменных окружения (удобно для Render)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-# ✅ Админы: можно указать одного через ADMIN_ID или список через ADMIN_IDS
-#   ADMIN_IDS формат: "12345,67890"
+# ✅ Админы: можно указать одного через ADMIN_ID или список через ADMIN_IDS ("12345,67890")
 _admin_ids_env = os.getenv("ADMIN_IDS", "")
 ADMIN_IDS = [int(x) for x in _admin_ids_env.split(",") if x.strip().lstrip("-").isdigit()]
 
@@ -12,22 +11,24 @@ _admin_id_single = os.getenv("ADMIN_ID")
 if _admin_id_single and _admin_id_single.strip().lstrip("-").isdigit():
     ADMIN_IDS.append(int(_admin_id_single))
 
-# 📂 Старый SQLite (оставляю на всякий случай, но для Supabase не нужен)
+# 📂 Старый SQLite (оставим пока, но для Supabase не нужен)
 DB_NAME = os.getenv("DB_NAME", "participants.db")
 
 # 🌐 PostgreSQL (Supabase) — строка подключения
-# Можно задать через переменную окружения DATABASE_URL, иначе возьмётся значение ниже.
-DB_URL = os.getenv(
+# В приоритете переменная окружения DATABASE_URL (Render → Environment).
+# Если её нет, используем значение ниже.
+DATABASE_URL = os.getenv(
     "DATABASE_URL",
-    postgresql://postgres:Energizer_776GF4_SUPABASE@db.foptoqqcyjlbcwpwtecc.supabase.co:5432/postgres?sslmode=require
-
+    "postgresql://postgres:Energizer_776GF4_SUPABASE@db.foptoqqcyjlbcwpwtecc.supabase.co:5432/postgres?sslmode=require",
 )
+# Для совместимости, если где-то в коде используется DB_URL
+DB_URL = DATABASE_URL
 
 # 📢 Опционально: ID группы для анонсов победителя (например, -1001234567890)
 _group_id = os.getenv("GROUP_CHAT_ID")
 GROUP_CHAT_ID = int(_group_id) if _group_id and _group_id.strip().lstrip("-").isdigit() else None
 
-# ✅ Допустимые кодовые слова (можешь поменять на свои)
+# ✅ Допустимые кодовые слова
 VALID_CODES = [
     "HEADSHOTKING",
     "MOOVICTORY",
