@@ -15,13 +15,27 @@ if _admin_id_single and _admin_id_single.strip().lstrip("-").isdigit():
 DB_NAME = os.getenv("DB_NAME", "participants.db")
 
 # 🌐 PostgreSQL (Supabase) — строка подключения
-# В приоритете переменная окружения DATABASE_URL (Render → Environment).
-# Если её нет, используем значение ниже.
-DATABASE_URL = os.getenv(
-    "DATABASE_URL",
-    "postgresql://postgres:Energizer_776GF4_SUPABASE@db.foptoqqcyjlbcwpwtecc.supabase.co:5432/postgres?sslmode=require",
+# Берём из окружения (Render → Environment), обрезаем пробелы/переносы.
+# Если не задано в окружении — используем дефолт ниже.
+_default_dsn = (
+    "postgresql://postgres:Energizer_776GF4_SUPABASE@"
+    "db.foptoqqcyjlbcwpwtecc.supabase.co:5432/postgres?sslmode=require"
 )
-# Для совместимости, если где-то в коде используется DB_URL
+_database_url_raw = os.getenv("DATABASE_URL", _default_dsn)
+_database_url_raw = _database_url_raw.strip() if _database_url_raw else ""
+
+# Если вдруг забыли добавить sslmode — добавим безопасный
+def _ensure_sslmode(dsn: str) -> str:
+    if not dsn:
+        return dsn
+    if "sslmode=" in dsn:
+        return dsn
+    sep = "&" if "?" in dsn else "?"
+    return f"{dsn}{sep}sslmode=require"
+
+DATABASE_URL = _ensure_sslmode(_database_url_raw)
+
+# Для совместимости
 DB_URL = DATABASE_URL
 
 # 📢 Опционально: ID группы для анонсов победителя (например, -1001234567890)
@@ -35,6 +49,6 @@ VALID_CODES = [
     "CLUTCHGOD",
 ]
 
-# 🧩 Настройки постоянного буквенно-цифрового ID участника
+# 🧩 Настройки постоянного буквенно‑цифрового ID участника
 PARTICIPANT_CODE_LEN = int(os.getenv("PARTICIPANT_CODE_LEN", "6"))
 PARTICIPANT_CODE_ALPHABET = "abcdefghjkmnpqrstuvwxyzABCDEFGHJKMNPQRSTUVWXYZ23456789"  # без 0/O/1/l
