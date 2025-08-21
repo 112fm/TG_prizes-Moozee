@@ -1,13 +1,9 @@
 from __future__ import annotations
 
-"""
-Бот розыгрыша с кодовыми словами (Postgres/Supabase).
-"""
-
 import os
 import asyncio
 import csv
-import datetime
+import datetime as dt
 import logging
 import random
 import secrets
@@ -19,10 +15,10 @@ from aiogram.filters import Command
 from aiogram.types import BotCommand, BufferedInputFile
 
 from aiohttp import web
-from aiogram.webhook.aiohttp_server import setup_application
+from aiogram.webhook.aiohttp_server import setup_application  # без SimpleRequestHandler
 
-import psycopg
 from psycopg_pool import AsyncConnectionPool
+from psycopg.rows import tuple_row
 
 import config
 
@@ -37,16 +33,11 @@ dp = Dispatcher()
 # ---------- КОНФИГ ----------
 PART_LEN = config.PARTICIPANT_CODE_LEN
 ALPHABET = config.PARTICIPANT_CODE_ALPHABET
-DATABASE_URL = os.getenv("DATABASE_URL", "").strip()  # postgresql://.../postgres?sslmode=require
 
-if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL не задан — укажите строку подключения Supabase в переменных окружения Render.")
-
-# Пул соединений с Postgres
-pg_pool: AsyncConnectionPool | None = None
+# ---------- ПУЛ ПОДКЛЮЧЕНИЙ К БД ----------
+POOL: AsyncConnectionPool | None = None
 
 
-# ---------- УТИЛЫ ----------
 def make_participant_code() -> str:
     return "".join(secrets.choice(ALPHABET) for _ in range(PART_LEN))
 
@@ -55,114 +46,77 @@ def is_admin(user_id: int) -> bool:
     return user_id in set(getattr(config, "ADMIN_IDS", []) or [])
 
 
-# ---------- БАЗА: ИНИТ/ХЕЛПЕРЫ ----------
-async def init_pool() -> None:
-    """Создать пул соединений, если ещё не создан."""
-    global pg_pool
-    if pg_pool is None:
-        # Пул лениво открывается, а дальше переиспользуется
-        pg_pool = AsyncConnectionPool(
-            DATABASE_URL,
-            min_size=1,
-            max_size=5,
-            timeout=30,
-        )
-        await pg_pool.open()
-        logger.info("Подключение к Postgres (Supabase) установлено.")
+# ---------- БАЗА: ИНИТ ТАБЛИЦ ----------
+INIT_SQL = """
+create table if not exists users (
+    user_id bigint primary key,
+    username text,
+    first_name text,
+    participant_code text unique not null
+);
+
+create table if not exists entries (
+    id bigserial primary key,
+    user_id bigint not null references users(user_id) on delete cascade,
+    username text,
+    first_name text,
+    code text not null,
+    entry_number int not null,
+    created_at timestamp not null default now()
+);
+
+create unique index if not exists idx_entries_user_code on entries(user_id, code);
+"""
 
 
 async def init_db() -> None:
-    """Миграции (создание таблиц/индексов)."""
-    await init_pool()
-    assert pg_pool is not None
-
-    async with pg_pool.connection() as conn:
-        async with conn.cursor() as cur:
-            # Таблица пользователей со стабильным participant_code
-            await cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS users (
-                    user_id BIGINT PRIMARY KEY,
-                    username TEXT,
-                    first_name TEXT,
-                    participant_code TEXT UNIQUE NOT NULL
-                );
-                """
-            )
-
-            # Таблица заявок
-            await cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS entries (
-                    id BIGSERIAL PRIMARY KEY,
-                    user_id BIGINT NOT NULL REFERENCES users(user_id),
-                    username TEXT,
-                    first_name TEXT,
-                    code TEXT NOT NULL,
-                    entry_number INT NOT NULL,
-                    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-                );
-                """
-            )
-
-            # Уникальная пара (user_id, code)
-            await cur.execute(
-                "CREATE UNIQUE INDEX IF NOT EXISTS idx_entries_user_code ON entries(user_id, code);"
-            )
-
-        await conn.commit()
-
-    logger.info("База данных и таблицы готовы к работе.")
+    assert POOL is not None
+    async with POOL.connection() as conn:
+        await conn.execute(INIT_SQL)
+    logger.info("Postgres готов: таблицы проверены/созданы.")
 
 
-# Небольшие хелперы для запросов
-async def pg_fetchone(sql: str, params: tuple = ()) -> tuple | None:
-    assert pg_pool is not None
-    async with pg_pool.connection() as conn:
-        async with conn.cursor() as cur:
-            await cur.execute(sql, params)
-            return await cur.fetchone()
-
-
-async def pg_fetchall(sql: str, params: tuple = ()) -> list[tuple]:
-    assert pg_pool is not None
-    async with pg_pool.connection() as conn:
-        async with conn.cursor() as cur:
-            await cur.execute(sql, params)
-            return await cur.fetchall()
-
-
-async def pg_execute(sql: str, params: tuple = ()) -> None:
-    assert pg_pool is not None
-    async with pg_pool.connection() as conn:
-        async with conn.cursor() as cur:
-            await cur.execute(sql, params)
-        await conn.commit()
+# ---------- КОМАНДЫ МЕНЮ ----------
+async def set_bot_commands() -> None:
+    commands = [
+        BotCommand(command="start", description="Начать и получить инструкцию"),
+        BotCommand(command="my", description="Показать свои коды"),
+        BotCommand(command="export", description="Выгрузить CSV (админ)"),
+        BotCommand(command="draw", description="Розыгрыш (админ)"),
+        BotCommand(command="stats", description="Статистика (админ)"),
+    ]
+    await bot.set_my_commands(commands)
 
 
 # ---------- ЛОГИКА ----------
 async def ensure_user(user_id: int, username: str | None, first_name: str | None) -> str:
     """Убедиться, что пользователь есть в users и имеет постоянный participant_code. Вернёт participant_code."""
-    row = await pg_fetchone("SELECT participant_code FROM users WHERE user_id = %s", (user_id,))
-    if row:
-        await pg_execute(
-            "UPDATE users SET username = %s, first_name = %s WHERE user_id = %s",
-            (username or "", first_name or "", user_id),
+    assert POOL is not None
+    async with POOL.connection() as conn:
+        # есть?
+        async with conn.cursor(row_factory=tuple_row) as cur:
+            await cur.execute("select participant_code from users where user_id = %s", (user_id,))
+            row = await cur.fetchone()
+            if row:
+                await conn.execute(
+                    "update users set username = %s, first_name = %s where user_id = %s",
+                    (username or "", first_name or "", user_id),
+                )
+                return row[0]
+
+        # генерим уникальный participant_code
+        while True:
+            pc = make_participant_code()
+            async with conn.cursor(row_factory=tuple_row) as cur:
+                await cur.execute("select 1 from users where participant_code = %s", (pc,))
+                if await cur.fetchone() is None:
+                    break
+
+        await conn.execute(
+            "insert into users(user_id, username, first_name, participant_code) values (%s, %s, %s, %s)",
+            (user_id, username or "", first_name or "", pc),
         )
-        return row[0]
-
-    # Сгенерировать уникальный participant_code
-    while True:
-        pc = make_participant_code()
-        exists = await pg_fetchone("SELECT 1 FROM users WHERE participant_code = %s", (pc,))
-        if not exists:
-            break
-
-    await pg_execute(
-        "INSERT INTO users (user_id, username, first_name, participant_code) VALUES (%s, %s, %s, %s)",
-        (user_id, username or "", first_name or "", pc),
-    )
-    return pc
+        return pc
 
 
 async def register_entry(user_id: int, username: str | None, first_name: str | None, code: str) -> tuple[int, bool, str]:
@@ -171,42 +125,60 @@ async def register_entry(user_id: int, username: str | None, first_name: str | N
     Возвращает (entry_number, is_new, participant_code)
     is_new=False — если этот код уже был у пользователя.
     """
+    assert POOL is not None
     participant_code = await ensure_user(user_id, username, first_name)
 
-    row = await pg_fetchone(
-        "SELECT entry_number FROM entries WHERE user_id = %s AND code = %s",
-        (user_id, code),
-    )
-    if row:
-        return row[0], False, participant_code
+    async with POOL.connection() as conn:
+        # уже был код?
+        async with conn.cursor(row_factory=tuple_row) as cur:
+            await cur.execute("select entry_number from entries where user_id = %s and code = %s", (user_id, code))
+            row = await cur.fetchone()
+            if row:
+                return row[0], False, participant_code
 
-    row = await pg_fetchone("SELECT COALESCE(MAX(entry_number), 0) FROM entries")
-    new_number = (row[0] if row else 0) + 1
+        # новый общий порядковый номер
+        async with conn.cursor(row_factory=tuple_row) as cur:
+            await cur.execute("select coalesce(max(entry_number), 0) from entries")
+            max_number = (await cur.fetchone())[0] or 0
+        new_number = int(max_number) + 1
 
-    await pg_execute(
-        """
-        INSERT INTO entries (user_id, username, first_name, code, entry_number)
-        VALUES (%s, %s, %s, %s, %s)
-        """,
-        (user_id, username or "", first_name or "", code, new_number),
-    )
-    return new_number, True, participant_code
+        created_at = dt.datetime.now()
+        await conn.execute(
+            "insert into entries(user_id, username, first_name, code, entry_number, created_at) "
+            "values (%s, %s, %s, %s, %s, %s)",
+            (user_id, username or "", first_name or "", code, new_number, created_at),
+        )
+        return new_number, True, participant_code
 
 
 async def get_user_entries(user_id: int) -> tuple[str, list[tuple[str, int]]]:
-    row = await pg_fetchone("SELECT participant_code FROM users WHERE user_id = %s", (user_id,))
-    participant_code = row[0] if row else "—"
-    rows = await pg_fetchall(
-        "SELECT code, entry_number FROM entries WHERE user_id = %s ORDER BY created_at",
-        (user_id,),
-    )
+    """Вернёт (participant_code, [(code, entry_number), ...])"""
+    assert POOL is not None
+    async with POOL.connection() as conn:
+        async with conn.cursor(row_factory=tuple_row) as cur:
+            await cur.execute("select participant_code from users where user_id = %s", (user_id,))
+            row = await cur.fetchone()
+            participant_code = row[0] if row else "—"
+
+        async with conn.cursor(row_factory=tuple_row) as cur:
+            await cur.execute(
+                "select code, entry_number from entries where user_id = %s order by created_at",
+                (user_id,),
+            )
+            rows = await cur.fetchall()
+
     return participant_code, [(r[0], r[1]) for r in rows]
 
 
 async def export_csv() -> bytes:
-    rows = await pg_fetchall(
-        "SELECT e.user_id, e.username, e.code, e.entry_number FROM entries e ORDER BY e.id"
-    )
+    assert POOL is not None
+    async with POOL.connection() as conn, conn.cursor(row_factory=tuple_row) as cur:
+        await cur.execute(
+            "select e.user_id, e.username, e.code, e.entry_number "
+            "from entries e order by e.id"
+        )
+        rows = await cur.fetchall()
+
     buff = StringIO()
     writer = csv.writer(buff)
     writer.writerow(["user_id", "username", "code", "entry_number"])
@@ -216,15 +188,24 @@ async def export_csv() -> bytes:
 
 
 async def draw_weighted_winner() -> dict | None:
-    users = await pg_fetchall(
-        """
-        SELECT u.user_id, u.username, u.first_name, u.participant_code, COUNT(DISTINCT e.code) AS codes_count
-        FROM users u
-        LEFT JOIN entries e ON e.user_id = u.user_id
-        GROUP BY u.user_id, u.username, u.first_name, u.participant_code
-        """
-    )
-    code_rows = await pg_fetchall("SELECT user_id, code FROM entries")
+    """
+    Взвешенный победитель: для каждого пользователя число «билетов» = кол-ву уникальных кодов (1..3).
+    Суммируем билеты и выбираем случайно по весам.
+    """
+    assert POOL is not None
+    async with POOL.connection() as conn:
+        async with conn.cursor(row_factory=tuple_row) as cur:
+            await cur.execute(
+                "select u.user_id, u.username, u.first_name, u.participant_code, "
+                "count(distinct e.code) as codes_count "
+                "from users u left join entries e on e.user_id = u.user_id "
+                "group by u.user_id, u.username, u.first_name, u.participant_code"
+            )
+            users = await cur.fetchall()
+
+        async with conn.cursor(row_factory=tuple_row) as cur:
+            await cur.execute("select user_id, code from entries")
+            code_rows = await cur.fetchall()
 
     if not users:
         return None
@@ -238,16 +219,14 @@ async def draw_weighted_winner() -> dict | None:
         tickets = int(ccount or 0)
         if tickets <= 0:
             continue
-        pool.append(
-            {
-                "user_id": uid,
-                "username": username or "",
-                "first_name": first_name or "",
-                "participant_code": pcode,
-                "codes_count": tickets,
-                "codes": codes_by_user.get(uid, []),
-            }
-        )
+        pool.append({
+            "user_id": uid,
+            "username": username or "",
+            "first_name": first_name or "",
+            "participant_code": pcode,
+            "codes_count": tickets,
+            "codes": codes_by_user.get(uid, []),
+        })
 
     if not pool:
         return None
@@ -261,13 +240,12 @@ async def draw_weighted_winner() -> dict | None:
             p["tickets"] = w
             return p
         upto += w
-
     choice = random.choice(pool)
     choice["tickets"] = choice["codes_count"]
     return choice
 
 
-# ---------- ХЕНДЛЕРЫ ----------
+# ---------- ХЕНдЛЕРЫ ----------
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message) -> None:
     pcode = await ensure_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
@@ -336,12 +314,15 @@ async def cmd_stats(message: types.Message) -> None:
     if not is_admin(message.from_user.id):
         await message.answer("Эта команда доступна только администратору.")
         return
-    row = await pg_fetchone("SELECT COUNT(*) FROM entries")
-    total_entries = row[0] if row else 0
-    row = await pg_fetchone("SELECT COUNT(DISTINCT user_id) FROM entries")
-    unique_users = row[0] if row else 0
-    row = await pg_fetchone("SELECT COUNT(DISTINCT code) FROM entries")
-    unique_codes = row[0] if row else 0
+    assert POOL is not None
+    async with POOL.connection() as conn, conn.cursor(row_factory=tuple_row) as cur:
+        await cur.execute("select count(*) from entries")
+        total_entries = (await cur.fetchone())[0]
+        await cur.execute("select count(distinct user_id) from entries")
+        unique_users = (await cur.fetchone())[0]
+        await cur.execute("select count(distinct code) from entries")
+        unique_codes = (await cur.fetchone())[0]
+
     text = (
         "Статистика:\n"
         f"Всего заявок: {total_entries}\n"
@@ -372,12 +353,12 @@ async def handle_code(message: types.Message) -> None:
     if is_new:
         await message.answer(
             f"Принято! Твой постоянный ID: `{pcode}`\nТы участник №{entry_number} в розыгрыше.",
-            parse_mode="Markdown",
+            parse_mode="Markdown"
         )
     else:
         await message.answer(
             f"Этот код уже зарегистрирован за тобой как №{entry_number}.\nТвой ID: `{pcode}`",
-            parse_mode="Markdown",
+            parse_mode="Markdown"
         )
 
 
@@ -389,6 +370,17 @@ PORT = int(os.getenv("PORT", "10000"))
 
 
 async def _on_startup(app: web.Application):
+    global POOL
+    # поднимаем пул соединений к PG
+    dsn = getattr(config, "DATABASE_URL", None) or getattr(config, "DB_URL", None)
+    if not dsn:
+        raise RuntimeError("DATABASE_URL/DB_URL is not set in config")
+    POOL = AsyncConnectionPool(
+        conninfo=dsn,
+        max_size=8,
+        kwargs={"autocommit": True},
+        timeout=30,
+    )
     await init_db()
     await set_bot_commands()
     if WEBHOOK_URL:
@@ -404,19 +396,21 @@ async def _on_shutdown(app: web.Application):
         logger.info("Webhook снят.")
     except Exception:
         pass
-    if pg_pool is not None:
-        await pg_pool.close()
-        logger.info("Пул соединений с Postgres закрыт.")
+    global POOL
+    if POOL:
+        await POOL.close()
+        POOL = None
 
 
 def create_app() -> web.Application:
     app = web.Application()
 
+    # healthcheck
     async def health(_):
         return web.Response(text="ok")
-
     app.router.add_get("/health", health)
 
+    # ЯВНЫЙ обработчик Telegram webhook + проверка секрета
     async def telegram_webhook(request: web.Request) -> web.Response:
         if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != WEBHOOK_SECRET:
             return web.Response(status=403, text="forbidden")
@@ -426,28 +420,43 @@ def create_app() -> web.Application:
             return web.Response(status=400, text="bad json")
 
         try:
-            # На всякий случай гарантируем инициализацию
+            # гарантируем что БД/таблицы созданы ПЕРЕД обработкой апдейта
             await init_db()
+
             update = types.Update.model_validate(data)
             await dp.feed_update(bot, update)
         except Exception as e:
             logger.exception("Ошибка обработки webhook: %s", e)
-            # Telegram нужно вернуть 200, иначе он будет ретраить
             return web.Response(text="ok")
 
         return web.Response(text="ok")
 
     app.router.add_post(WEBHOOK_PATH, telegram_webhook)
 
+    # регистрация хуков старта/остановки
     setup_application(app, dp, bot=bot, on_startup=[_on_startup], on_shutdown=[_on_shutdown])
     return app
 
 
 async def _run_polling():
+    # локальный режим: поднимаем пул и стартуем
+    global POOL
+    dsn = getattr(config, "DATABASE_URL", None) or getattr(config, "DB_URL", None)
+    POOL = AsyncConnectionPool(
+        conninfo=dsn,
+        max_size=8,
+        kwargs={"autocommit": True},
+        timeout=30,
+    )
     await init_db()
     await set_bot_commands()
     logger.info("Бот запущен (polling). Ожидание сообщений...")
-    await dp.start_polling(bot)
+    try:
+        await dp.start_polling(bot)
+    finally:
+        if POOL:
+            await POOL.close()
+            POOL = None
 
 
 if __name__ == "__main__":
