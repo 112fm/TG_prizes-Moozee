@@ -1,11 +1,9 @@
-
 aiogram==3.22.0
 aiosqlite==0.21.0
 
-# Файл requirements.txt содержит список зависимостей,
-# которые необходимо установить перед запуском бота.
-# Aiogram — асинхронный фреймворк для разработки Telegram‑ботов,
-# aiosqlite — асинхронный драйвер для работы с SQLite.
+# Работа с PostgreSQL
 psycopg[binary]>=3.2
-aiogram>=3.5
+psycopg-pool>=3.2
+
+# Веб и утилиты
 aiohttp>=3.9
