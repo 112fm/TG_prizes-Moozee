@@ -12,8 +12,16 @@ _admin_id_single = os.getenv("ADMIN_ID")
 if _admin_id_single and _admin_id_single.strip().lstrip("-").isdigit():
     ADMIN_IDS.append(int(_admin_id_single))
 
-# 📂 База данных (SQLite-файл рядом с кодом)
+# 📂 Старый SQLite (оставляю на всякий случай, но для Supabase не нужен)
 DB_NAME = os.getenv("DB_NAME", "participants.db")
+
+# 🌐 PostgreSQL (Supabase) — строка подключения
+# Можно задать через переменную окружения DATABASE_URL, иначе возьмётся значение ниже.
+DB_URL = os.getenv(
+    "DATABASE_URL",
+    postgresql://postgres:Energizer_776GF4_SUPABASE@db.foptoqqcyjlbcwpwtecc.supabase.co:5432/postgres?sslmode=require
+
+)
 
 # 📢 Опционально: ID группы для анонсов победителя (например, -1001234567890)
 _group_id = os.getenv("GROUP_CHAT_ID")
