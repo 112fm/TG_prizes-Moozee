@@ -7,3 +7,4 @@ aiosqlite==0.21.0
 # Aiogram — асинхронный фреймворк для разработки Telegram‑ботов,
 # aiosqlite — асинхронный драйвер для работы с SQLite.
 asyncpg
+asyncpg==0.29.0

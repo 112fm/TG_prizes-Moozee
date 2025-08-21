@@ -1,26 +1,24 @@
 """
-Бот розыгрыша с кодовыми словами.
+Бот розыгрыша с кодовыми словами. (Supabase/Postgres)
 """
+from __future__ import annotations
 
 import os
 import asyncio
-import csv
 import datetime
 import logging
-import random
-import secrets
-from io import StringIO
-from collections import defaultdict
+from typing import Optional
 
-from aiogram import Bot, Dispatcher, types
+from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.types import BotCommand, BufferedInputFile
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from aiohttp import web
 from aiogram.webhook.aiohttp_server import setup_application  # без SimpleRequestHandler
 
-import aiosqlite
 import config
+import db  # наш новый слой БД
 
 # ---------- ЛОГИ ----------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -30,194 +28,81 @@ logger = logging.getLogger(__name__)
 bot = Bot(token=config.BOT_TOKEN)
 dp = Dispatcher()
 
-# ---------- КОНФИГ/БД ----------
-DB_NAME = getattr(config, "DB_NAME", os.getenv("DB_NAME", "participants.db"))
+# ---------- КОНФИГ ----------
 PART_LEN = config.PARTICIPANT_CODE_LEN
 ALPHABET = config.PARTICIPANT_CODE_ALPHABET
 
-# ---------- УТИЛЫ ----------
-def make_participant_code() -> str:
-    return "".join(secrets.choice(ALPHABET) for _ in range(PART_LEN))
-
-def is_admin(user_id: int) -> bool:
-    return user_id in set(getattr(config, "ADMIN_IDS", []) or [])
-
-# ---------- ИНИТ БД + МИГРАЦИИ ----------
-async def init_db() -> None:
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute(
-            """
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                username TEXT,
-                first_name TEXT,
-                participant_code TEXT UNIQUE NOT NULL
-            );
-            """
-        )
-        await db.execute(
-            """
-            CREATE TABLE IF NOT EXISTS entries (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                username TEXT,
-                first_name TEXT,
-                code TEXT NOT NULL,
-                entry_number INTEGER NOT NULL,
-                created_at TEXT NOT NULL,
-                FOREIGN KEY(user_id) REFERENCES users(user_id)
-            );
-            """
-        )
-        await db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_entries_user_code ON entries(user_id, code);")
-        await db.commit()
-    logger.info("База данных и таблицы готовы к работе.")
+WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/webhook")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # https://<app>.onrender.com/webhook
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "change-me")
+PORT = int(os.getenv("PORT", "10000"))
 
 # ---------- КОМАНДЫ МЕНЮ ----------
 async def set_bot_commands() -> None:
     commands = [
         BotCommand(command="start", description="Начать и получить инструкцию"),
         BotCommand(command="my", description="Показать свои коды"),
+        BotCommand(command="settings", description="Мои уведомления"),
         BotCommand(command="export", description="Выгрузить CSV (админ)"),
         BotCommand(command="draw", description="Розыгрыш (админ)"),
         BotCommand(command="stats", description="Статистика (админ)"),
+        BotCommand(command="broadcast_video", description="Разослать про новый выпуск (админ)"),
     ]
     await bot.set_my_commands(commands)
 
-# ---------- ЛОГИКА ----------
-async def ensure_user(db, user_id: int, username: str | None, first_name: str | None) -> str:
-    cur = await db.execute("SELECT participant_code FROM users WHERE user_id = ?", (user_id,))
-    row = await cur.fetchone()
-    if row:
-        await db.execute(
-            "UPDATE users SET username = ?, first_name = ? WHERE user_id = ?",
-            (username or "", first_name or "", user_id),
-        )
-        return row[0]
-    while True:
-        pc = make_participant_code()
-        cur2 = await db.execute("SELECT 1 FROM users WHERE participant_code = ?", (pc,))
-        if not await cur2.fetchone():
-            break
-    await db.execute(
-        "INSERT INTO users (user_id, username, first_name, participant_code) VALUES (?, ?, ?, ?)",
-        (user_id, username or "", first_name or "", pc),
-    )
-    return pc
+# ---------- ХЕЛПЕРЫ ----------
+def is_admin(user_id: int) -> bool:
+    return user_id in set(getattr(config, "ADMIN_IDS", []) or [])
 
-async def register_entry(user_id: int, username: str | None, first_name: str | None, code: str) -> tuple[int, bool, str]:
-    async with aiosqlite.connect(DB_NAME) as db:
-        participant_code = await ensure_user(db, user_id, username, first_name)
+def build_settings_kb(prefs: dict) -> types.InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    def row(label: str, field: str, val: bool):
+        icon = "✅" if val else "❌"
+        b.button(text=f"{label}: {icon}", callback_data=f"toggle:{field}")
+    row("Результаты розыгрыша", "notify_results", prefs.get("notify_results", True))
+    row("Новые выпуски", "notify_new_video", prefs.get("notify_new_video", True))
+    row("Стримы", "notify_streams", prefs.get("notify_streams", True))
+    b.adjust(1)
+    return b.as_markup()
 
-        cur = await db.execute("SELECT entry_number FROM entries WHERE user_id = ? AND code = ?", (user_id, code))
-        row = await cur.fetchone()
-        if row:
-            await db.commit()
-            return row[0], False, participant_code
-
-        cur = await db.execute("SELECT MAX(entry_number) FROM entries")
-        max_number = (await cur.fetchone())[0] or 0
-        new_number = max_number + 1
-
-        created_at = datetime.datetime.now().isoformat()
-        await db.execute(
-            "INSERT INTO entries (user_id, username, first_name, code, entry_number, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (user_id, username or "", first_name or "", code, new_number, created_at),
-        )
-        await db.commit()
-        return new_number, True, participant_code
-
-async def get_user_entries(user_id: int) -> tuple[str, list[tuple[str,int]]]:
-    async with aiosqlite.connect(DB_NAME) as db:
-        cur = await db.execute("SELECT participant_code FROM users WHERE user_id = ?", (user_id,))
-        row = await cur.fetchone()
-        participant_code = row[0] if row else "—"
-        cur = await db.execute(
-            "SELECT code, entry_number FROM entries WHERE user_id = ? ORDER BY created_at", (user_id,)
-        )
-        rows = await cur.fetchall()
-    return participant_code, [(r[0], r[1]) for r in rows]
-
-async def export_csv() -> bytes:
-    async with aiosqlite.connect(DB_NAME) as db:
-        cur = await db.execute(
-            "SELECT e.user_id, e.username, e.code, e.entry_number FROM entries e ORDER BY e.id"
-        )
-        rows = await cur.fetchall()
-    buff = StringIO()
-    writer = csv.writer(buff)
-    writer.writerow(["user_id", "username", "code", "entry_number"])
-    for r in rows:
-        writer.writerow(r)
-    return buff.getvalue().encode("utf-8")
-
-async def draw_weighted_winner() -> dict | None:
-    async with aiosqlite.connect(DB_NAME) as db:
-        cur = await db.execute(
-            "SELECT u.user_id, u.username, u.first_name, u.participant_code, COUNT(DISTINCT e.code) AS codes_count "
-            "FROM users u LEFT JOIN entries e ON e.user_id = u.user_id "
-            "GROUP BY u.user_id, u.username, u.first_name, u.participant_code"
-        )
-        users = await cur.fetchall()
-        cur = await db.execute("SELECT user_id, code FROM entries")
-        code_rows = await cur.fetchall()
-
-    if not users:
-        return None
-
-    codes_by_user = defaultdict(list)
-    for uid, code in code_rows:
-        codes_by_user[uid].append(code)
-
-    pool = []
-    for uid, username, first_name, pcode, ccount in users:
-        tickets = int(ccount or 0)
-        if tickets <= 0:
-            continue
-        pool.append({
-            "user_id": uid,
-            "username": username or "",
-            "first_name": first_name or "",
-            "participant_code": pcode,
-            "codes_count": tickets,
-            "codes": codes_by_user.get(uid, []),
-        })
-
-    if not pool:
-        return None
-
-    weights = [p["codes_count"] for p in pool]
-    total = sum(weights)
-    r = random.uniform(0, total)
-    upto = 0
-    for p, w in zip(pool, weights):
-        if upto + w >= r:
-            p["tickets"] = w
-            return p
-        upto += w
-    choice = random.choice(pool)
-    choice["tickets"] = choice["codes_count"]
-    return choice
+async def broadcast_to(kind: str, text: str) -> int:
+    """
+    Массовая отправка c ограничением скорости.
+    kind in {'video','results','streams'}
+    """
+    user_ids = await db.list_subscribers_for(kind)
+    sent = 0
+    batch = 20
+    for i in range(0, len(user_ids), batch):
+        chunk = user_ids[i:i+batch]
+        tasks = []
+        for uid in chunk:
+            tasks.append(bot.send_message(uid, text))
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        sent += sum(1 for r in results if not isinstance(r, Exception))
+        await asyncio.sleep(1)  # не агрим Телеграм
+    return sent
 
 # ---------- ХЕНДЛЕРЫ ----------
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message) -> None:
-    async with aiosqlite.connect(DB_NAME) as db:
-        pcode = await ensure_user(db, message.from_user.id, message.from_user.username, message.from_user.first_name)
-        await db.commit()
+    pcode = await db.ensure_user(
+        message.from_user.id, message.from_user.username, message.from_user.first_name,
+        PART_LEN, ALPHABET
+    )
     text = (
         f"Привет, {message.from_user.first_name or 'друг'} 👋\n\n"
         "Отправь кодовое слово, чтобы участвовать в розыгрыше.\n"
         "Чем больше найденных кодов (до 3), тем выше шанс при розыгрыше.\n\n"
         f"Твой постоянный ID участника: `{pcode}`\n"
-        "Посмотреть свои коды: /my"
+        "Посмотреть свои коды: /my\n"
+        "Настроить уведомления: /settings"
     )
     await message.answer(text, parse_mode="Markdown")
 
 @dp.message(Command("my"))
 async def cmd_my(message: types.Message) -> None:
-    pcode, entries = await get_user_entries(message.from_user.id)
+    pcode, entries = await db.get_user_entries(message.from_user.id)
     if not entries:
         await message.answer(f"Твой ID: `{pcode}`\nТы ещё не вводил кодовые слова.", parse_mode="Markdown")
         return
@@ -226,12 +111,27 @@ async def cmd_my(message: types.Message) -> None:
         lines.append(f"№{number} — {code}")
     await message.answer("\n".join(lines), parse_mode="Markdown")
 
+@dp.message(Command("settings"))
+async def cmd_settings(message: types.Message) -> None:
+    # убедимся, что пользователь создан
+    await db.ensure_user(message.from_user.id, message.from_user.username, message.from_user.first_name,
+                         PART_LEN, ALPHABET)
+    prefs = await db.get_prefs(message.from_user.id)
+    await message.answer("Что присылать?", reply_markup=build_settings_kb(prefs))
+
+@dp.callback_query(F.data.startswith("toggle:"))
+async def cb_toggle_pref(cq: types.CallbackQuery):
+    field = cq.data.split(":", 1)[1]
+    prefs = await db.toggle_pref(cq.from_user.id, field)
+    await cq.message.edit_reply_markup(reply_markup=build_settings_kb(prefs))
+    await cq.answer("Сохранено")
+
 @dp.message(Command("export"))
 async def cmd_export(message: types.Message) -> None:
     if not is_admin(message.from_user.id):
         await message.answer("Эта команда доступна только администратору.")
         return
-    csv_bytes = await export_csv()
+    csv_bytes = await db.export_csv()
     file = BufferedInputFile(csv_bytes, filename="participants.csv")
     await message.answer_document(file, caption="CSV со списком участников")
 
@@ -240,7 +140,7 @@ async def cmd_draw(message: types.Message) -> None:
     if not is_admin(message.from_user.id):
         await message.answer("Эта команда доступна только администратору.")
         return
-    winner = await draw_weighted_winner()
+    winner = await db.draw_weighted_winner()
     if not winner:
         await message.answer("Пока нет участников для розыгрыша.")
         return
@@ -264,23 +164,27 @@ async def cmd_draw(message: types.Message) -> None:
 
 @dp.message(Command("stats"))
 async def cmd_stats(message: types.Message) -> None:
+    # простая статистика через CSV мы уже можем получить; детальную статистику перенесём позже
+    await message.answer("Статистика через /export (CSV). Отдельный отчёт добавим позже.")
+
+@dp.message(Command("broadcast_video"))
+async def cmd_broadcast_video(message: types.Message) -> None:
     if not is_admin(message.from_user.id):
         await message.answer("Эта команда доступна только администратору.")
         return
-    async with aiosqlite.connect(DB_NAME) as db:
-        cur = await db.execute("SELECT COUNT(*) FROM entries")
-        total_entries = (await cur.fetchone())[0]
-        cur = await db.execute("SELECT COUNT(DISTINCT user_id) FROM entries")
-        unique_users = (await cur.fetchone())[0]
-        cur = await db.execute("SELECT COUNT(DISTINCT code) FROM entries")
-        unique_codes = (await cur.fetchone())[0]
-    text = (
-        "Статистика:\n"
-        f"Всего заявок: {total_entries}\n"
-        f"Уникальных пользователей: {unique_users}\n"
-        f"Уникальных кодов: {unique_codes}"
-    )
-    await message.answer(text)
+    # Формат: /broadcast_video <ссылка> <текст...>
+    parts = message.text.split(maxsplit=2)
+    if len(parts) < 3:
+        await message.answer(
+            "Формат:\n/broadcast_video <ссылка> <текст>\n\nНапример:\n"
+            "/broadcast_video https://youtu.be/abcde Новый выпуск на канале!"
+        )
+        return
+    url = parts[1]
+    text = parts[2]
+    full = f"🎬 Новый выпуск!\n{text}\n{url}"
+    sent = await broadcast_to("video", full)
+    await message.answer(f"Отправлено {sent} пользователям (подписка «Новые выпуски»).")
 
 @dp.message()
 async def handle_code(message: types.Message) -> None:
@@ -294,11 +198,14 @@ async def handle_code(message: types.Message) -> None:
     if code not in valid_codes:
         await message.answer("Кодовое слово неверно. Попробуйте ещё раз.")
         return
-    entry_number, is_new, pcode = await register_entry(
+
+    entry_number, is_new, pcode = await db.register_entry(
         user_id=message.from_user.id,
         username=message.from_user.username,
         first_name=message.from_user.first_name,
         code=code,
+        part_len=PART_LEN,
+        alphabet=ALPHABET,
     )
     if is_new:
         await message.answer(
@@ -312,13 +219,8 @@ async def handle_code(message: types.Message) -> None:
         )
 
 # ---------- ЗАПУСК: WEBHOOK или POLLING ----------
-WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/webhook")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # https://<app>.onrender.com/webhook
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "change-me")
-PORT = int(os.getenv("PORT", "10000"))
-
 async def _on_startup(app: web.Application):
-    await init_db()
+    await db.init()           # <— ВАЖНО: инициализация Postgres
     await set_bot_commands()
     if WEBHOOK_URL:
         await bot.set_webhook(url=WEBHOOK_URL, secret_token=WEBHOOK_SECRET)
@@ -336,9 +238,7 @@ async def _on_shutdown(app: web.Application):
 def create_app() -> web.Application:
     app = web.Application()
 
-    # healthcheck
-    async def health(_):
-        return web.Response(text="ok")
+    async def health(_): return web.Response(text="ok")
     app.router.add_get("/health", health)
 
     # ЯВНЫЙ обработчик Telegram webhook + проверка секрета
@@ -351,9 +251,7 @@ def create_app() -> web.Application:
             return web.Response(status=400, text="bad json")
 
         try:
-            # гарантируем что БД/таблицы созданы ПЕРЕД обработкой апдейта
-            await init_db()
-
+            await db.init()  # на всякий случай
             update = types.Update.model_validate(data)
             await dp.feed_update(bot, update)
         except Exception as e:
@@ -364,12 +262,11 @@ def create_app() -> web.Application:
 
     app.router.add_post(WEBHOOK_PATH, telegram_webhook)
 
-    # регистрация хуков старта/остановки
     setup_application(app, dp, bot=bot, on_startup=[_on_startup], on_shutdown=[_on_shutdown])
     return app
 
 async def _run_polling():
-    await init_db()
+    await db.init()
     await set_bot_commands()
     logger.info("Бот запущен (polling). Ожидание сообщений...")
     await dp.start_polling(bot)
