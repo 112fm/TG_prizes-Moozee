@@ -69,8 +69,23 @@ create unique index if not exists idx_entries_user_code on entries(user_id, code
 """
 
 
+def _get_dsn() -> str:
+    dsn = getattr(config, "DATABASE_URL", None) or getattr(config, "DB_URL", None)
+    if not dsn:
+        raise RuntimeError("DATABASE_URL/DB_URL is not set in config")
+    return dsn
+
+
 async def init_db() -> None:
-    assert POOL is not None
+    """Ленивый подъём пула + создание схемы (можно вызывать сколько угодно раз)."""
+    global POOL
+    if POOL is None:
+        POOL = AsyncConnectionPool(
+            conninfo=_get_dsn(),
+            max_size=8,
+            kwargs={"autocommit": True},
+            timeout=30,
+        )
     async with POOL.connection() as conn:
         await conn.execute(INIT_SQL)
     logger.info("Postgres готов: таблицы проверены/созданы.")
@@ -91,9 +106,8 @@ async def set_bot_commands() -> None:
 # ---------- ЛОГИКА ----------
 async def ensure_user(user_id: int, username: str | None, first_name: str | None) -> str:
     """Убедиться, что пользователь есть в users и имеет постоянный participant_code. Вернёт participant_code."""
-    assert POOL is not None
-    async with POOL.connection() as conn:
-        # есть?
+    await init_db()
+    async with POOL.connection() as conn:  # type: ignore[union-attr]
         async with conn.cursor(row_factory=tuple_row) as cur:
             await cur.execute("select participant_code from users where user_id = %s", (user_id,))
             row = await cur.fetchone()
@@ -104,7 +118,6 @@ async def ensure_user(user_id: int, username: str | None, first_name: str | None
                 )
                 return row[0]
 
-        # генерим уникальный participant_code
         while True:
             pc = make_participant_code()
             async with conn.cursor(row_factory=tuple_row) as cur:
@@ -120,23 +133,17 @@ async def ensure_user(user_id: int, username: str | None, first_name: str | None
 
 
 async def register_entry(user_id: int, username: str | None, first_name: str | None, code: str) -> tuple[int, bool, str]:
-    """
-    Зарегистрировать код для пользователя.
-    Возвращает (entry_number, is_new, participant_code)
-    is_new=False — если этот код уже был у пользователя.
-    """
-    assert POOL is not None
+    """Зарегистрировать код для пользователя. Возвращает (entry_number, is_new, participant_code)."""
+    await init_db()
     participant_code = await ensure_user(user_id, username, first_name)
 
-    async with POOL.connection() as conn:
-        # уже был код?
+    async with POOL.connection() as conn:  # type: ignore[union-attr]
         async with conn.cursor(row_factory=tuple_row) as cur:
             await cur.execute("select entry_number from entries where user_id = %s and code = %s", (user_id, code))
             row = await cur.fetchone()
             if row:
                 return row[0], False, participant_code
 
-        # новый общий порядковый номер
         async with conn.cursor(row_factory=tuple_row) as cur:
             await cur.execute("select coalesce(max(entry_number), 0) from entries")
             max_number = (await cur.fetchone())[0] or 0
@@ -153,8 +160,8 @@ async def register_entry(user_id: int, username: str | None, first_name: str | N
 
 async def get_user_entries(user_id: int) -> tuple[str, list[tuple[str, int]]]:
     """Вернёт (participant_code, [(code, entry_number), ...])"""
-    assert POOL is not None
-    async with POOL.connection() as conn:
+    await init_db()
+    async with POOL.connection() as conn:  # type: ignore[union-attr]
         async with conn.cursor(row_factory=tuple_row) as cur:
             await cur.execute("select participant_code from users where user_id = %s", (user_id,))
             row = await cur.fetchone()
@@ -171,8 +178,8 @@ async def get_user_entries(user_id: int) -> tuple[str, list[tuple[str, int]]]:
 
 
 async def export_csv() -> bytes:
-    assert POOL is not None
-    async with POOL.connection() as conn, conn.cursor(row_factory=tuple_row) as cur:
+    await init_db()
+    async with POOL.connection() as conn, conn.cursor(row_factory=tuple_row) as cur:  # type: ignore[union-attr]
         await cur.execute(
             "select e.user_id, e.username, e.code, e.entry_number "
             "from entries e order by e.id"
@@ -188,12 +195,9 @@ async def export_csv() -> bytes:
 
 
 async def draw_weighted_winner() -> dict | None:
-    """
-    Взвешенный победитель: для каждого пользователя число «билетов» = кол-ву уникальных кодов (1..3).
-    Суммируем билеты и выбираем случайно по весам.
-    """
-    assert POOL is not None
-    async with POOL.connection() as conn:
+    """Взвешенный победитель: билеты = кол-ву уникальных кодов."""
+    await init_db()
+    async with POOL.connection() as conn:  # type: ignore[union-attr]
         async with conn.cursor(row_factory=tuple_row) as cur:
             await cur.execute(
                 "select u.user_id, u.username, u.first_name, u.participant_code, "
@@ -245,7 +249,7 @@ async def draw_weighted_winner() -> dict | None:
     return choice
 
 
-# ---------- ХЕНдЛЕРЫ ----------
+# ---------- ХЕНДЛЕРЫ ----------
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message) -> None:
     pcode = await ensure_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
@@ -314,8 +318,8 @@ async def cmd_stats(message: types.Message) -> None:
     if not is_admin(message.from_user.id):
         await message.answer("Эта команда доступна только администратору.")
         return
-    assert POOL is not None
-    async with POOL.connection() as conn, conn.cursor(row_factory=tuple_row) as cur:
+    await init_db()
+    async with POOL.connection() as conn, conn.cursor(row_factory=tuple_row) as cur:  # type: ignore[union-attr]
         await cur.execute("select count(*) from entries")
         total_entries = (await cur.fetchone())[0]
         await cur.execute("select count(distinct user_id) from entries")
@@ -370,18 +374,7 @@ PORT = int(os.getenv("PORT", "10000"))
 
 
 async def _on_startup(app: web.Application):
-    global POOL
-    # поднимаем пул соединений к PG
-    dsn = getattr(config, "DATABASE_URL", None) or getattr(config, "DB_URL", None)
-    if not dsn:
-        raise RuntimeError("DATABASE_URL/DB_URL is not set in config")
-    POOL = AsyncConnectionPool(
-        conninfo=dsn,
-        max_size=8,
-        kwargs={"autocommit": True},
-        timeout=30,
-    )
-    await init_db()
+    await init_db()                # тут поднимается пул и создаётся схема
     await set_bot_commands()
     if WEBHOOK_URL:
         await bot.set_webhook(url=WEBHOOK_URL, secret_token=WEBHOOK_SECRET)
@@ -405,7 +398,6 @@ async def _on_shutdown(app: web.Application):
 def create_app() -> web.Application:
     app = web.Application()
 
-    # healthcheck
     async def health(_):
         return web.Response(text="ok")
     app.router.add_get("/health", health)
@@ -420,9 +412,7 @@ def create_app() -> web.Application:
             return web.Response(status=400, text="bad json")
 
         try:
-            # гарантируем что БД/таблицы созданы ПЕРЕД обработкой апдейта
-            await init_db()
-
+            await init_db()  # гарантируем, что пул/схема готовы
             update = types.Update.model_validate(data)
             await dp.feed_update(bot, update)
         except Exception as e:
@@ -433,27 +423,18 @@ def create_app() -> web.Application:
 
     app.router.add_post(WEBHOOK_PATH, telegram_webhook)
 
-    # регистрация хуков старта/остановки
     setup_application(app, dp, bot=bot, on_startup=[_on_startup], on_shutdown=[_on_shutdown])
     return app
 
 
 async def _run_polling():
-    # локальный режим: поднимаем пул и стартуем
-    global POOL
-    dsn = getattr(config, "DATABASE_URL", None) or getattr(config, "DB_URL", None)
-    POOL = AsyncConnectionPool(
-        conninfo=dsn,
-        max_size=8,
-        kwargs={"autocommit": True},
-        timeout=30,
-    )
     await init_db()
     await set_bot_commands()
     logger.info("Бот запущен (polling). Ожидание сообщений...")
     try:
         await dp.start_polling(bot)
     finally:
+        global POOL
         if POOL:
             await POOL.close()
             POOL = None
