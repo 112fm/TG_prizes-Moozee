@@ -70,9 +70,14 @@ create unique index if not exists idx_entries_user_code on entries(user_id, code
 
 
 def _get_dsn() -> str:
+    """Берём DSN из config, убираем лишние пробелы/переводы строк и гарантируем sslmode=require."""
     dsn = getattr(config, "DATABASE_URL", None) or getattr(config, "DB_URL", None)
     if not dsn:
         raise RuntimeError("DATABASE_URL/DB_URL is not set in config")
+    dsn = dsn.strip()  # важно: убираем возможный \n в конце
+    if "sslmode=" not in dsn:
+        sep = "&" if "?" in dsn else "?"
+        dsn = f"{dsn}{sep}sslmode=require"
     return dsn
 
 
