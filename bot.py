@@ -9,13 +9,14 @@ import random
 import secrets
 from io import StringIO
 from collections import defaultdict
+from urllib.parse import urlsplit, urlunsplit
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.types import BotCommand, BufferedInputFile
 
 from aiohttp import web
-from aiogram.webhook.aiohttp_server import setup_application  # без SimpleRequestHandler
+from aiogram.webhook.aiohttp_server import setup_application
 
 from psycopg_pool import AsyncConnectionPool
 from psycopg.rows import tuple_row
@@ -69,16 +70,46 @@ create unique index if not exists idx_entries_user_code on entries(user_id, code
 """
 
 
-def _get_dsn() -> str:
-    """Берём DSN из config, убираем лишние пробелы/переводы строк и гарантируем sslmode=require."""
-    dsn = getattr(config, "DATABASE_URL", None) or getattr(config, "DB_URL", None)
+def _normalize_dsn(raw: str) -> str:
+    """
+    Нормализует DSN:
+    - убирает пробелы/переводы строк;
+    - гарантирует sslmode=require;
+    - если Supabase и порт 5432 — заменяет на 6543 (IPv4 совместимый Transaction Pooler).
+    """
+    dsn = (raw or "").strip()
+
     if not dsn:
-        raise RuntimeError("DATABASE_URL/DB_URL is not set in config")
-    dsn = dsn.strip()  # важно: убираем возможный \n в конце
-    if "sslmode=" not in dsn:
-        sep = "&" if "?" in dsn else "?"
-        dsn = f"{dsn}{sep}sslmode=require"
+        raise RuntimeError("DATABASE_URL/DB_URL is empty")
+
+    # Разбираем url
+    u = urlsplit(dsn)
+
+    # Заменим порт 5432 на 6543 для *.supabase.co (IPv6 -> IPv4 pooler)
+    netloc = u.netloc
+    if ".supabase.co" in u.hostname or ".supabase.net" in u.hostname if u.hostname else False:
+        # если явно указан 5432 — заменим на 6543
+        if ":" in netloc:
+            host, sep, port = netloc.rpartition(":")
+            if port.isdigit() and port == "5432":
+                netloc = f"{host}:6543"
+        else:
+            # порт мог быть по умолчанию — явно проставим 6543
+            netloc = f"{netloc}:6543"
+
+    # Параметры query
+    query = u.query or ""
+    if "sslmode=" not in query:
+        query = (query + "&" if query else "") + "sslmode=require"
+
+    # Сборка обратно
+    dsn = urlunsplit((u.scheme, netloc, u.path, query, u.fragment))
     return dsn
+
+
+def _get_dsn() -> str:
+    dsn = getattr(config, "DATABASE_URL", None) or getattr(config, "DB_URL", None)
+    return _normalize_dsn(dsn or "")
 
 
 async def init_db() -> None:
@@ -91,6 +122,9 @@ async def init_db() -> None:
             kwargs={"autocommit": True},
             timeout=30,
         )
+        # Явно открываем пул, чтобы ошибка соединения проявилась сразу
+        await POOL.open(wait=True)
+
     async with POOL.connection() as conn:
         await conn.execute(INIT_SQL)
     logger.info("Postgres готов: таблицы проверены/созданы.")
@@ -379,7 +413,7 @@ PORT = int(os.getenv("PORT", "10000"))
 
 
 async def _on_startup(app: web.Application):
-    await init_db()                # тут поднимается пул и создаётся схема
+    await init_db()
     await set_bot_commands()
     if WEBHOOK_URL:
         await bot.set_webhook(url=WEBHOOK_URL, secret_token=WEBHOOK_SECRET)
@@ -407,7 +441,6 @@ def create_app() -> web.Application:
         return web.Response(text="ok")
     app.router.add_get("/health", health)
 
-    # ЯВНЫЙ обработчик Telegram webhook + проверка секрета
     async def telegram_webhook(request: web.Request) -> web.Response:
         if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != WEBHOOK_SECRET:
             return web.Response(status=403, text="forbidden")
@@ -417,7 +450,7 @@ def create_app() -> web.Application:
             return web.Response(status=400, text="bad json")
 
         try:
-            await init_db()  # гарантируем, что пул/схема готовы
+            await init_db()
             update = types.Update.model_validate(data)
             await dp.feed_update(bot, update)
         except Exception as e:

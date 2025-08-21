@@ -5,5 +5,5 @@ aiosqlite==0.21.0
 psycopg[binary]>=3.2
 psycopg-pool>=3.2
 
-# Веб и утилиты
+# Веб
 aiohttp>=3.9
