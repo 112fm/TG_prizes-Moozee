@@ -71,11 +71,23 @@ create unique index if not exists idx_entries_user_code on entries(user_id, code
 """
 
 
+def _mask_url(u: str) -> str:
+    try:
+        p = urlparse(u)
+        if p.password:
+            return u.replace(p.password, "****")
+    except Exception:
+        pass
+    return u
+
+
 def _get_dsn() -> str:
     """
-    Берём DATABASE_URL/DB_URL, приводим к валидному виду,
-    принуждаем sslmode=require, для Supabase используем порт 6543,
-    и добавляем hostaddr=<IPv4>, чтобы соединяться по IPv4.
+    Нормализую DSN:
+    - убираю переносы строк/пробелы;
+    - принуждаю sslmode=require, connect_timeout=8, application_name;
+    - для Supabase заменяю порт 5432 -> 6543 (pooler);
+    - вставляю hostaddr=IPv4 (либо из PGHOSTADDR, либо резолвлю сам).
     """
     raw = (getattr(config, "DATABASE_URL", None) or getattr(config, "DB_URL", None) or "").strip()
     if not raw:
@@ -88,20 +100,30 @@ def _get_dsn() -> str:
 
     q = dict(parse_qsl(u.query, keep_blank_values=True))
     q["sslmode"] = "require"
+    q.setdefault("connect_timeout", "8")
+    q.setdefault("application_name", "tg_prizes_bot")
 
     host = u.hostname or ""
     port = u.port or 5432
+
+    # Supabase → используем транзакционный пулер на 6543 (IPv4-friendly)
     if (".supabase.co" in host or ".supabase.net" in host) and port == 5432:
         port = 6543
 
-    try:
-        infos = socket.getaddrinfo(host, port, family=socket.AF_INET, type=socket.SOCK_STREAM)
-        if infos:
-            ipv4 = infos[0][4][0]
-            q["hostaddr"] = ipv4
-    except Exception:
-        pass
+    # 1) Если задан PGHOSTADDR — используем его как hostaddr
+    hostaddr_env = os.getenv("PGHOSTADDR", "").strip()
+    if hostaddr_env:
+        q["hostaddr"] = hostaddr_env
+    else:
+        # 2) Иначе попробуем сами получить A-запись (IPv4)
+        try:
+            infos = socket.getaddrinfo(host, port, family=socket.AF_INET, type=socket.SOCK_STREAM)
+            if infos:
+                q["hostaddr"] = infos[0][4][0]
+        except Exception as e:
+            logger.warning("DNS resolve failed for %s:%s (%s). Will connect by hostname only.", host, port, e)
 
+    # Собираем netloc, сохраняя userinfo
     userinfo = ""
     if u.username:
         userinfo = u.username
@@ -111,8 +133,16 @@ def _get_dsn() -> str:
     netloc = f"{userinfo}{host}:{port}"
 
     new_query = urlencode(q)
-    new_url = urlunparse((u.scheme, netloc, u.path, u.params, new_query, u.fragment))
-    return new_url
+    final = urlunparse((u.scheme, netloc, u.path, u.params, new_query, u.fragment))
+
+    # Отладка (без пароля)
+    logger.info("DB DSN prepared: %s", _mask_url(final))
+    if "hostaddr" in q:
+        logger.info("DB host=%s port=%s hostaddr=%s", host, port, q["hostaddr"])
+    else:
+        logger.info("DB host=%s port=%s (no hostaddr)", host, port)
+
+    return final
 
 
 async def init_db() -> None:
@@ -433,7 +463,6 @@ async def _on_shutdown(app: web.Application):
 
 
 async def _process_update_async(data: dict) -> None:
-    """Фоновая обработка апдейта, чтобы вебхук отвечал мгновенно."""
     try:
         update = types.Update.model_validate(data)
         await dp.feed_update(bot, update)
@@ -449,7 +478,6 @@ def create_app() -> web.Application:
     app.router.add_get("/health", health)
 
     async def telegram_webhook(request: web.Request) -> web.Response:
-        # Проверяем секрет только если он задан (не пуст)
         if WEBHOOK_SECRET and request.headers.get("X-Telegram-Bot-Api-Secret-Token") != WEBHOOK_SECRET:
             return web.Response(status=403, text="forbidden")
         try:
@@ -457,7 +485,6 @@ def create_app() -> web.Application:
         except Exception:
             return web.Response(status=400, text="bad json")
 
-        # Отвечаем Telegram сразу, обработку запускаем в фоне
         asyncio.create_task(_process_update_async(data))
         return web.Response(text="ok")
 
