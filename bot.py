@@ -9,7 +9,8 @@ import random
 import secrets
 from io import StringIO
 from collections import defaultdict
-from urllib.parse import urlsplit, urlunsplit
+import socket
+from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
@@ -70,46 +71,58 @@ create unique index if not exists idx_entries_user_code on entries(user_id, code
 """
 
 
-def _normalize_dsn(raw: str) -> str:
-    """
-    Нормализует DSN:
-    - убирает пробелы/переводы строк;
-    - гарантирует sslmode=require;
-    - если Supabase и порт 5432 — заменяет на 6543 (IPv4 совместимый Transaction Pooler).
-    """
-    dsn = (raw or "").strip()
-
-    if not dsn:
-        raise RuntimeError("DATABASE_URL/DB_URL is empty")
-
-    # Разбираем url
-    u = urlsplit(dsn)
-
-    # Заменим порт 5432 на 6543 для *.supabase.co (IPv6 -> IPv4 pooler)
-    netloc = u.netloc
-    if ".supabase.co" in u.hostname or ".supabase.net" in u.hostname if u.hostname else False:
-        # если явно указан 5432 — заменим на 6543
-        if ":" in netloc:
-            host, sep, port = netloc.rpartition(":")
-            if port.isdigit() and port == "5432":
-                netloc = f"{host}:6543"
-        else:
-            # порт мог быть по умолчанию — явно проставим 6543
-            netloc = f"{netloc}:6543"
-
-    # Параметры query
-    query = u.query or ""
-    if "sslmode=" not in query:
-        query = (query + "&" if query else "") + "sslmode=require"
-
-    # Сборка обратно
-    dsn = urlunsplit((u.scheme, netloc, u.path, query, u.fragment))
-    return dsn
-
-
 def _get_dsn() -> str:
-    dsn = getattr(config, "DATABASE_URL", None) or getattr(config, "DB_URL", None)
-    return _normalize_dsn(dsn or "")
+    """
+    Берём DATABASE_URL/DB_URL, приводим к валидному виду,
+    принуждаем sslmode=require, для Supabase используем порт 6543,
+    и добавляем hostaddr=<IPv4>, чтобы соединяться по IPv4.
+    """
+    raw = (getattr(config, "DATABASE_URL", None) or getattr(config, "DB_URL", None) or "").strip()
+    if not raw:
+        raise RuntimeError("DATABASE_URL/DB_URL is not set in config")
+
+    # убрать возможные переноси/пробелы
+    raw = raw.replace("\n", "").replace("\r", "").strip()
+
+    u = urlparse(raw)
+    if u.scheme not in ("postgresql", "postgres"):
+        raise RuntimeError("DATABASE_URL must start with postgresql:// or postgres://")
+
+    # query -> dict
+    q = dict(parse_qsl(u.query, keep_blank_values=True))
+
+    # sslmode=require
+    q["sslmode"] = "require"
+
+    host = u.hostname or ""
+    port = u.port or 5432
+
+    # Для Supabase используем 6543 (transaction pooler, IPv4‑friendly)
+    if (".supabase.co" in host or ".supabase.net" in host) and port == 5432:
+        port = 6543
+
+    # Разрешаем домен строго в IPv4 и кладём в hostaddr
+    try:
+        infos = socket.getaddrinfo(host, port, family=socket.AF_INET, type=socket.SOCK_STREAM)
+        if infos:
+            ipv4 = infos[0][4][0]
+            q["hostaddr"] = ipv4
+    except Exception:
+        # если не вышло — идём как есть
+        pass
+
+    # пересобираем netloc с сохранением userinfo
+    userinfo = ""
+    if u.username:
+        userinfo = u.username
+        if u.password:
+            userinfo += f":{u.password}"
+        userinfo += "@"
+    netloc = f"{userinfo}{host}:{port}"
+
+    new_query = urlencode(q)
+    new_url = urlunparse((u.scheme, netloc, u.path, u.params, new_query, u.fragment))
+    return new_url
 
 
 async def init_db() -> None:
