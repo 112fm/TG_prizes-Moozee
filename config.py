@@ -1,26 +1,30 @@
 import os
+import re
 
 # 🔑 Токен бота
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-# 👑 Админы: один через ADMIN_ID или список через ADMIN_IDS="1,2,3"
-_admin_ids_env = os.getenv("ADMIN_IDS", "")
-ADMIN_IDS = [int(x) for x in _admin_ids_env.split(",") if x.strip().lstrip("-").isdigit()]
-
-_admin_id_single = os.getenv("ADMIN_ID")
-if _admin_id_single and _admin_id_single.strip().lstrip("-").isdigit():
-    ADMIN_IDS.append(int(_admin_id_single))
+# 👑 Админы
+# Принимает:
+#  - ADMIN_IDS="1,2,3"
+#  - ADMIN_ID="1,2"  или "1"
+_admins_raw = (os.getenv("ADMIN_IDS") or os.getenv("ADMIN_ID") or "").strip()
+ADMIN_IDS = sorted({
+    int(x)
+    for x in re.split(r"[,\s]+", _admins_raw)
+    if x.strip().lstrip("-").isdigit()
+})
 
 # 🗃 Старый SQLite (оставлен для совместимости, не используется с PG)
 DB_NAME = os.getenv("DB_NAME", "participants.db")
 
 # 🌐 PostgreSQL (Supabase)
 # В приоритете переменная окружения DATABASE_URL.
-# Если её нет — берём значение ниже. Важно: порт 6543 (Transaction Pooler, IPv4-compatible).
-DATABASE_URL = os.getenv(
+# Если её нет — используем дефолт (порт 6543 — Transaction Pooler, IPv4-compatible).
+DATABASE_URL = (os.getenv(
     "DATABASE_URL",
     "postgresql://postgres:Energizer_776GF4_SUPABASE@db.foptoqqcyjlbcwpwtecc.supabase.co:6543/postgres?sslmode=require",
-).strip()
+) or "").strip()
 
 # Для совместимости с кодом
 DB_URL = DATABASE_URL

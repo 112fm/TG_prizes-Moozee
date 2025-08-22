@@ -11,10 +11,20 @@ from io import StringIO
 from collections import defaultdict
 import socket
 from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
+from typing import Dict, List, Tuple
+import sys  # <-- добавлено
 
-from aiogram import Bot, Dispatcher, types
+# --- ВАЖНО ДЛЯ WINDOWS: psycopg + asyncio ---
+if sys.platform.startswith("win"):
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
-from aiogram.types import BotCommand, BufferedInputFile
+from aiogram.types import BotCommand, BufferedInputFile, CallbackQuery
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.fsm.state import StatesGroup, State
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.storage.memory import MemoryStorage
 
 from aiohttp import web
 from aiogram.webhook.aiohttp_server import setup_application
@@ -28,9 +38,11 @@ import config
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
 
-# ---------- БОТ/DP ----------
+# ---------- ХРАНИЛИЩЕ FSM ----------
+dp = Dispatcher(storage=MemoryStorage())
+
+# ---------- БОТ ----------
 bot = Bot(token=config.BOT_TOKEN)
-dp = Dispatcher()
 
 # ---------- КОНФИГ ----------
 PART_LEN = config.PARTICIPANT_CODE_LEN
@@ -39,37 +51,42 @@ ALPHABET = config.PARTICIPANT_CODE_ALPHABET
 # ---------- ПУЛ ПОДКЛЮЧЕНИЙ К БД ----------
 POOL: AsyncConnectionPool | None = None
 
-
 def make_participant_code() -> str:
     return "".join(secrets.choice(ALPHABET) for _ in range(PART_LEN))
-
 
 def is_admin(user_id: int) -> bool:
     return user_id in set(getattr(config, "ADMIN_IDS", []) or [])
 
-
 # ---------- БАЗА: ИНИТ ТАБЛИЦ ----------
 INIT_SQL = """
-create table if not exists users (
+create table if not exists public.users (
     user_id bigint primary key,
     username text,
     first_name text,
     participant_code text unique not null
 );
 
-create table if not exists entries (
+create table if not exists public.entries (
     id bigserial primary key,
-    user_id bigint not null references users(user_id) on delete cascade,
+    user_id bigint not null references public.users(user_id) on delete cascade,
     username text,
     first_name text,
     code text not null,
     entry_number int not null,
     created_at timestamp not null default now()
 );
+create unique index if not exists idx_entries_user_code on public.entries(user_id, code);
 
-create unique index if not exists idx_entries_user_code on entries(user_id, code);
+-- подписки на рассылки
+create table if not exists public.user_prefs (
+    user_id bigint primary key references public.users(user_id) on delete cascade,
+    notify_results boolean not null default true,
+    notify_new_video boolean not null default true,
+    notify_streams boolean not null default true,
+    created_at timestamp not null default now(),
+    updated_at timestamp not null default now()
+);
 """
-
 
 def _mask_url(u: str) -> str:
     try:
@@ -80,15 +97,7 @@ def _mask_url(u: str) -> str:
         pass
     return u
 
-
 def _get_dsn() -> str:
-    """
-    Нормализую DSN:
-    - убираю переносы строк/пробелы;
-    - принуждаю sslmode=require, connect_timeout=8, application_name;
-    - для Supabase заменяю порт 5432 -> 6543 (pooler);
-    - вставляю hostaddr=IPv4 (либо из PGHOSTADDR, либо резолвлю сам).
-    """
     raw = (getattr(config, "DATABASE_URL", None) or getattr(config, "DB_URL", None) or "").strip()
     if not raw:
         raise RuntimeError("DATABASE_URL/DB_URL is not set in config")
@@ -105,17 +114,13 @@ def _get_dsn() -> str:
 
     host = u.hostname or ""
     port = u.port or 5432
-
-    # Supabase → используем транзакционный пулер на 6543 (IPv4-friendly)
     if (".supabase.co" in host or ".supabase.net" in host) and port == 5432:
         port = 6543
 
-    # 1) Если задан PGHOSTADDR — используем его как hostaddr
     hostaddr_env = os.getenv("PGHOSTADDR", "").strip()
     if hostaddr_env:
         q["hostaddr"] = hostaddr_env
     else:
-        # 2) Иначе попробуем сами получить A-запись (IPv4)
         try:
             infos = socket.getaddrinfo(host, port, family=socket.AF_INET, type=socket.SOCK_STREAM)
             if infos:
@@ -123,7 +128,6 @@ def _get_dsn() -> str:
         except Exception as e:
             logger.warning("DNS resolve failed for %s:%s (%s). Will connect by hostname only.", host, port, e)
 
-    # Собираем netloc, сохраняя userinfo
     userinfo = ""
     if u.username:
         userinfo = u.username
@@ -134,19 +138,14 @@ def _get_dsn() -> str:
 
     new_query = urlencode(q)
     final = urlunparse((u.scheme, netloc, u.path, u.params, new_query, u.fragment))
-
-    # Отладка (без пароля)
     logger.info("DB DSN prepared: %s", _mask_url(final))
     if "hostaddr" in q:
         logger.info("DB host=%s port=%s hostaddr=%s", host, port, q["hostaddr"])
     else:
         logger.info("DB host=%s port=%s (no hostaddr)", host, port)
-
     return final
 
-
 async def init_db() -> None:
-    """Ленивый подъём пула + создание схемы (можно вызывать сколько угодно раз)."""
     global POOL
     if POOL is None:
         POOL = AsyncConnectionPool(
@@ -161,96 +160,96 @@ async def init_db() -> None:
         await conn.execute(INIT_SQL)
     logger.info("Postgres готов: таблицы проверены/созданы.")
 
-
 # ---------- КОМАНДЫ МЕНЮ ----------
 async def set_bot_commands() -> None:
     commands = [
-        BotCommand(command="start", description="Начать и получить инструкцию"),
-        BotCommand(command="my", description="Показать свои коды"),
+        BotCommand(command="start", description="Начать"),
+        BotCommand(command="my", description="Мои коды"),
+        BotCommand(command="prefs", description="Настройки уведомлений"),
         BotCommand(command="export", description="Выгрузить CSV (админ)"),
         BotCommand(command="draw", description="Розыгрыш (админ)"),
         BotCommand(command="stats", description="Статистика (админ)"),
+        BotCommand(command="admin", description="Админ‑панель"),
     ]
     await bot.set_my_commands(commands)
 
-
-# ---------- ЛОГИКА ----------
+# ---------- ЛОГИКА УЧАСТНИКОВ/КОДОВ ----------
 async def ensure_user(user_id: int, username: str | None, first_name: str | None) -> str:
     await init_db()
     async with POOL.connection() as conn:  # type: ignore[union-attr]
         async with conn.cursor(row_factory=tuple_row) as cur:
-            await cur.execute("select participant_code from users where user_id = %s", (user_id,))
+            await cur.execute("select participant_code from public.users where user_id = %s", (user_id,))
             row = await cur.fetchone()
             if row:
                 await conn.execute(
-                    "update users set username = %s, first_name = %s where user_id = %s",
+                    "update public.users set username = %s, first_name = %s where user_id = %s",
                     (username or "", first_name or "", user_id),
                 )
+                await conn.execute("""insert into public.user_prefs(user_id)
+                                      values (%s) on conflict (user_id) do nothing""", (user_id,))
                 return row[0]
 
         while True:
             pc = make_participant_code()
             async with conn.cursor(row_factory=tuple_row) as cur:
-                await cur.execute("select 1 from users where participant_code = %s", (pc,))
+                await cur.execute("select 1 from public.users where participant_code = %s", (pc,))
                 if await cur.fetchone() is None:
                     break
 
         await conn.execute(
-            "insert into users(user_id, username, first_name, participant_code) values (%s, %s, %s, %s)",
+            "insert into public.users(user_id, username, first_name, participant_code) values (%s, %s, %s, %s)",
             (user_id, username or "", first_name or "", pc),
         )
+        await conn.execute("""insert into public.user_prefs(user_id) values (%s)
+                              on conflict (user_id) do nothing""", (user_id,))
         return pc
-
 
 async def register_entry(user_id: int, username: str | None, first_name: str | None, code: str) -> tuple[int, bool, str]:
     await init_db()
     participant_code = await ensure_user(user_id, username, first_name)
-
     async with POOL.connection() as conn:  # type: ignore[union-attr]
         async with conn.cursor(row_factory=tuple_row) as cur:
-            await cur.execute("select entry_number from entries where user_id = %s and code = %s", (user_id, code))
+            await cur.execute("select entry_number from public.entries where user_id = %s and code = %s", (user_id, code))
             row = await cur.fetchone()
             if row:
                 return row[0], False, participant_code
 
         async with conn.cursor(row_factory=tuple_row) as cur:
-            await cur.execute("select coalesce(max(entry_number), 0) from entries")
+            await cur.execute("select coalesce(max(entry_number), 0) from public.entries")
             max_number = (await cur.fetchone())[0] or 0
         new_number = int(max_number) + 1
 
         created_at = dt.datetime.now()
         await conn.execute(
-            "insert into entries(user_id, username, first_name, code, entry_number, created_at) "
+            "insert into public.entries(user_id, username, first_name, code, entry_number, created_at) "
             "values (%s, %s, %s, %s, %s, %s)",
             (user_id, username or "", first_name or "", code, new_number, created_at),
         )
         return new_number, True, participant_code
 
-
 async def get_user_entries(user_id: int) -> tuple[str, list[tuple[str, int]]]:
     await init_db()
     async with POOL.connection() as conn:  # type: ignore[union-attr]
         async with conn.cursor(row_factory=tuple_row) as cur:
-            await cur.execute("select participant_code from users where user_id = %s", (user_id,))
+            await cur.execute("select participant_code from public.users where user_id = %s", (user_id,))
             row = await cur.fetchone()
             participant_code = row[0] if row else "—"
 
         async with conn.cursor(row_factory=tuple_row) as cur:
             await cur.execute(
-                "select code, entry_number from entries where user_id = %s order by created_at",
+                "select code, entry_number from public.entries where user_id = %s order by created_at",
                 (user_id,),
             )
             rows = await cur.fetchall()
 
     return participant_code, [(r[0], r[1]) for r in rows]
 
-
 async def export_csv() -> bytes:
     await init_db()
     async with POOL.connection() as conn, conn.cursor(row_factory=tuple_row) as cur:  # type: ignore[union-attr]
         await cur.execute(
             "select e.user_id, e.username, e.code, e.entry_number "
-            "from entries e order by e.id"
+            "from public.entries e order by e.id"
         )
         rows = await cur.fetchall()
 
@@ -261,7 +260,6 @@ async def export_csv() -> bytes:
         writer.writerow(r)
     return buff.getvalue().encode("utf-8")
 
-
 async def draw_weighted_winner() -> dict | None:
     await init_db()
     async with POOL.connection() as conn:  # type: ignore[union-attr]
@@ -269,21 +267,21 @@ async def draw_weighted_winner() -> dict | None:
             await cur.execute(
                 "select u.user_id, u.username, u.first_name, u.participant_code, "
                 "count(distinct e.code) as codes_count "
-                "from users u left join entries e on e.user_id = u.user_id "
+                "from public.users u left join public.entries e on e.user_id = u.user_id "
                 "group by u.user_id, u.username, u.first_name, u.participant_code"
             )
             users = await cur.fetchall()
 
-        async with conn.cursor(row_factory=tuple_row) as cur:
-            await cur.execute("select user_id, code from entries")
-            code_rows = await cur.fetchall()
+        async with POOL.connection() as conn2, conn2.cursor(row_factory=tuple_row) as cur2:
+            await cur2.execute("select user_id, code from public.entries")
+            code_rows = await cur2.fetchall()
 
     if not users:
         return None
 
-    codes_by_user = defaultdict(list)
+    codes_by_user: Dict[int, List[str]] = defaultdict(list)
     for uid, code in code_rows:
-        codes_by_user[uid].append(code)
+        codes_by_user[int(uid)].append(code)
 
     pool = []
     for uid, username, first_name, pcode, ccount in users:
@@ -291,12 +289,12 @@ async def draw_weighted_winner() -> dict | None:
         if tickets <= 0:
             continue
         pool.append({
-            "user_id": uid,
+            "user_id": int(uid),
             "username": username or "",
             "first_name": first_name or "",
             "participant_code": pcode,
             "codes_count": tickets,
-            "codes": codes_by_user.get(uid, []),
+            "codes": codes_by_user.get(int(uid), []),
         })
 
     if not pool:
@@ -305,7 +303,7 @@ async def draw_weighted_winner() -> dict | None:
     weights = [p["codes_count"] for p in pool]
     total = sum(weights)
     r = random.uniform(0, total)
-    upto = 0
+    upto = 0.0
     for p, w in zip(pool, weights):
         if upto + w >= r:
             p["tickets"] = w
@@ -315,8 +313,85 @@ async def draw_weighted_winner() -> dict | None:
     choice["tickets"] = choice["codes_count"]
     return choice
 
+# ---------- ПРЕДПОЧТЕНИЯ / РАССЫЛКИ ----------
+async def get_prefs(user_id: int) -> Dict[str, bool]:
+    await init_db()
+    async with POOL.connection() as conn, conn.cursor(row_factory=tuple_row) as cur:  # type: ignore[union-attr]
+        await cur.execute(
+            "select notify_results, notify_new_video, notify_streams from public.user_prefs where user_id = %s",
+            (user_id,)
+        )
+        row = await cur.fetchone()
+        if not row:
+            await conn.execute(
+                "insert into public.user_prefs(user_id) values (%s) on conflict (user_id) do nothing",
+                (user_id,)
+            )
+            return {"notify_results": True, "notify_new_video": True, "notify_streams": True}
+    return {
+        "notify_results": bool(row[0]),
+        "notify_new_video": bool(row[1]),
+        "notify_streams": bool(row[2]),
+    }
 
-# ---------- ХЕНДЛЕРЫ ----------
+async def toggle_pref(user_id: int, field: str) -> Dict[str, bool]:
+    assert field in ("notify_results", "notify_new_video", "notify_streams")
+    await init_db()
+    async with POOL.connection() as conn:  # type: ignore[union-attr]
+        await conn.execute(
+            "insert into public.user_prefs(user_id) values (%s) on conflict (user_id) do nothing",
+            (user_id,)
+        )
+        await conn.execute(
+            f"update public.user_prefs set {field} = not {field}, updated_at = now() where user_id = %s",
+            (user_id,)
+        )
+    return await get_prefs(user_id)
+
+async def list_subscribers_for(kind: str) -> List[int]:
+    field_map = {"video": "notify_new_video", "results": "notify_results", "streams": "notify_streams"}
+    field = field_map[kind]
+    await init_db()
+    async with POOL.connection() as conn, conn.cursor(row_factory=tuple_row) as cur:  # type: ignore[union-attr]
+        await cur.execute(
+            f"select u.user_id from public.user_prefs p join public.users u on u.user_id = p.user_id where p.{field} = true"
+        )
+        rows = await cur.fetchall()
+    return [int(r[0]) for r in rows]
+
+# ---------- FSM ДЛЯ РАССЫЛОК ----------
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.types import CallbackQuery
+from aiogram import F
+from aiogram.fsm.state import StatesGroup, State
+from aiogram.fsm.context import FSMContext
+
+class BroadcastState(StatesGroup):
+    btype = State()
+    text = State()
+
+def admin_keyboard() -> types.InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.button(text="📥 Экспорт CSV", callback_data="admin:export")
+    kb.button(text="🎯 Розыгрыш", callback_data="admin:draw")
+    kb.button(text="📊 Статистика", callback_data="admin:stats")
+    kb.button(text="📢 Рассылка: видео", callback_data="admin:broadcast:video")
+    kb.button(text="🔴 Рассылка: стрим", callback_data="admin:broadcast:streams")
+    kb.button(text="🏆 Рассылка: результаты", callback_data="admin:broadcast:results")
+    kb.adjust(2, 2, 2)
+    return kb.as_markup()
+
+def prefs_keyboard(prefs: Dict[str, bool]) -> types.InlineKeyboardMarkup:
+    def mark(v: bool) -> str:
+        return "✅" if v else "❌"
+    kb = InlineKeyboardBuilder()
+    kb.button(text=f"{mark(prefs['notify_new_video'])} Новые видео", callback_data="prefs:toggle:notify_new_video")
+    kb.button(text=f"{mark(prefs['notify_streams'])} Стримы", callback_data="prefs:toggle:notify_streams")
+    kb.button(text=f"{mark(prefs['notify_results'])} Результаты розыгрышей", callback_data="prefs:toggle:notify_results")
+    kb.adjust(1)
+    return kb.as_markup()
+
+# ---------- ХЕНДЛЕРЫ: ОБЩИЕ ----------
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message) -> None:
     pcode = await ensure_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
@@ -325,10 +400,10 @@ async def cmd_start(message: types.Message) -> None:
         "Отправь кодовое слово, чтобы участвовать в розыгрыше.\n"
         "Чем больше найденных кодов (до 3), тем выше шанс при розыгрыше.\n\n"
         f"Твой постоянный ID участника: `{pcode}`\n"
-        "Посмотреть свои коды: /my"
+        "Посмотреть свои коды: /my\n"
+        "Настроить уведомления: /prefs"
     )
     await message.answer(text, parse_mode="Markdown")
-
 
 @dp.message(Command("my"))
 async def cmd_my(message: types.Message) -> None:
@@ -341,6 +416,26 @@ async def cmd_my(message: types.Message) -> None:
         lines.append(f"№{number} — {code}")
     await message.answer("\n".join(lines), parse_mode="Markdown")
 
+@dp.message(Command("prefs"))
+async def cmd_prefs(message: types.Message) -> None:
+    await ensure_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
+    prefs = await get_prefs(message.from_user.id)
+    await message.answer("Выбери, какие уведомления получать:", reply_markup=prefs_keyboard(prefs))
+
+@dp.callback_query(F.data.startswith("prefs:toggle:"))
+async def cb_prefs_toggle(cb: CallbackQuery):
+    field = cb.data.split(":", 2)[2]
+    prefs = await toggle_pref(cb.from_user.id, field)
+    await cb.message.edit_text("Выбери, какие уведомления получать:", reply_markup=prefs_keyboard(prefs))
+    await cb.answer("Обновлено")
+
+# ---------- АДМИН-КОМАНДЫ И КНОПКИ ----------
+@dp.message(Command("admin"))
+async def cmd_admin(message: types.Message) -> None:
+    if not is_admin(message.from_user.id):
+        await message.answer("Эта команда доступна только администратору.")
+        return
+    await message.answer("Админ‑панель:", reply_markup=admin_keyboard())
 
 @dp.message(Command("export"))
 async def cmd_export(message: types.Message) -> None:
@@ -351,7 +446,6 @@ async def cmd_export(message: types.Message) -> None:
     file = BufferedInputFile(csv_bytes, filename="participants.csv")
     await message.answer_document(file, caption="CSV со списком участников")
 
-
 @dp.message(Command("draw"))
 async def cmd_draw(message: types.Message) -> None:
     if not is_admin(message.from_user.id):
@@ -361,14 +455,13 @@ async def cmd_draw(message: types.Message) -> None:
     if not winner:
         await message.answer("Пока нет участников для розыгрыша.")
         return
-
     uname = f"@{winner['username']}" if winner["username"] else f"user_id={winner['user_id']}"
     codes_list = ", ".join(winner["codes"]) if winner["codes"] else "—"
     text = (
         "🎉 *Победитель розыгрыша!*\n"
         f"Игрок: *{winner['first_name']}* ({uname})\n"
         f"ID участника: `{winner['participant_code']}`\n"
-        f"Найдено кодов: *{winner['codes_count']}* (вес в жеребьёвке)\n"
+        f"Найдено кодов: *{winner['codes_count']}* (вес)\n"
         f"Коды: {codes_list}"
     )
     await message.answer(text, parse_mode="Markdown")
@@ -379,7 +472,6 @@ async def cmd_draw(message: types.Message) -> None:
         except Exception as e:
             logger.warning("Не удалось отправить анонс в группу: %s", e)
 
-
 @dp.message(Command("stats"))
 async def cmd_stats(message: types.Message) -> None:
     if not is_admin(message.from_user.id):
@@ -387,11 +479,11 @@ async def cmd_stats(message: types.Message) -> None:
         return
     await init_db()
     async with POOL.connection() as conn, conn.cursor(row_factory=tuple_row) as cur:  # type: ignore[union-attr]
-        await cur.execute("select count(*) from entries")
+        await cur.execute("select count(*) from public.entries")
         total_entries = (await cur.fetchone())[0]
-        await cur.execute("select count(distinct user_id) from entries")
+        await cur.execute("select count(distinct user_id) from public.entries")
         unique_users = (await cur.fetchone())[0]
-        await cur.execute("select count(distinct code) from entries")
+        await cur.execute("select count(distinct code) from public.entries")
         unique_codes = (await cur.fetchone())[0]
 
     text = (
@@ -402,7 +494,120 @@ async def cmd_stats(message: types.Message) -> None:
     )
     await message.answer(text)
 
+@dp.callback_query(F.data == "admin:export")
+async def cb_admin_export(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        return await cb.answer("Только для админа", show_alert=True)
+    csv_bytes = await export_csv()
+    file = BufferedInputFile(csv_bytes, filename="participants.csv")
+    await cb.message.answer_document(file, caption="CSV со списком участников")
+    await cb.answer()
 
+@dp.callback_query(F.data == "admin:draw")
+async def cb_admin_draw(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        return await cb.answer("Только для админа", show_alert=True)
+    winner = await draw_weighted_winner()
+    if not winner:
+        await cb.message.answer("Пока нет участников для розыгрыша.")
+        return await cb.answer()
+    uname = f"@{winner['username']}" if winner["username"] else f"user_id={winner['user_id']}"
+    codes_list = ", ".join(winner["codes"]) if winner["codes"] else "—"
+    text = (
+        "🎉 *Победитель розыгрыша!*\n"
+        f"Игрок: *{winner['first_name']}* ({uname})\n"
+        f"ID участника: `{winner['participant_code']}`\n"
+        f"Найдено кодов: *{winner['codes_count']}*\n"
+        f"Коды: {codes_list}"
+    )
+    await cb.message.answer(text, parse_mode="Markdown")
+    await cb.answer()
+
+# ---------- РАССЫЛКИ ----------
+@dp.callback_query(F.data.startswith("admin:broadcast:"))
+async def cb_admin_broadcast(cb: CallbackQuery, state: FSMContext):
+    if not is_admin(cb.from_user.id):
+        return await cb.answer("Только для админа", show_alert=True)
+    _, _, btype = cb.data.split(":")
+    await state.set_state(BroadcastState.btype)
+    await state.update_data(btype=btype)
+    await state.set_state(BroadcastState.text)
+    await cb.message.answer(
+        "Пришли текст сообщения для рассылки (можно с ссылками). "
+        "После этого я покажу, сколько получателей, и попрошу подтверждение.\n\n"
+        "Чтобы отменить — /cancel"
+    )
+    await cb.answer()
+
+@dp.message(Command("cancel"))
+async def cmd_cancel(message: types.Message, state: FSMContext):
+    await state.clear()
+    await message.answer("Ок, отменил.")
+
+@dp.message(BroadcastState.text)
+async def broadcast_collect_text(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return await message.answer("Эта функция доступна только администратору.")
+    data = await state.get_data()
+    btype = data.get("btype", "video")
+    text = message.html_text or message.text or ""
+    await state.update_data(text=text)
+
+    kind_label = {"video": "Новое видео", "streams": "Стрим", "results": "Результаты"}[btype]
+    subs = await list_subscribers_for(btype)
+    kb = InlineKeyboardBuilder()
+    kb.button(text=f"✅ Разослать ({len(subs)})", callback_data="broadcast:confirm")
+    kb.button(text="❌ Отмена", callback_data="broadcast:cancel")
+    kb.adjust(2)
+    await message.answer(
+        f"Тип: <b>{kind_label}</b>\nПолучателей: <b>{len(subs)}</b>\n\n"
+        f"Предпросмотр:\n{text}",
+        parse_mode="HTML",
+        reply_markup=kb.as_markup(),
+    )
+
+@dp.callback_query(F.data == "broadcast:cancel")
+async def cb_broadcast_cancel(cb: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await cb.message.answer("Рассылка отменена.")
+    await cb.answer()
+
+async def _send_broadcast(btype: str, text: str, admin_chat_id: int):
+    subs = await list_subscribers_for(btype)
+    if not subs:
+        await bot.send_message(admin_chat_id, "Получателей нет. Рассылка не отправлена.")
+        return
+
+    sent = 0
+    failed = 0
+    for idx, uid in enumerate(subs, start=1):
+        try:
+            await bot.send_message(uid, text, disable_web_page_preview=False)
+            sent += 1
+        except Exception as e:
+            failed += 1
+            if failed <= 5:
+                logger.warning("Не доставлено %s: %s", uid, e)
+        await asyncio.sleep(0.05)  # ~20 msg/сек
+
+    await bot.send_message(
+        admin_chat_id,
+        f"Готово.\nТип: {btype}\nВсего получателей: {len(subs)}\nДоставлено: {sent}\nОшибок: {failed}"
+    )
+
+@dp.callback_query(F.data == "broadcast:confirm")
+async def cb_broadcast_confirm(cb: CallbackQuery, state: FSMContext):
+    if not is_admin(cb.from_user.id):
+        return await cb.answer("Только для админа", show_alert=True)
+    data = await state.get_data()
+    btype = data.get("btype", "video")
+    text = data.get("text", "")
+    await state.clear()
+    await cb.message.answer("Стартую рассылку… Отчёт пришлю сюда.")
+    asyncio.create_task(_send_broadcast(btype=btype, text=text, admin_chat_id=cb.from_user.id))
+    await cb.answer("Начал")
+
+# ---------- ПРИЁМ КОДОВ ----------
 @dp.message()
 async def handle_code(message: types.Message) -> None:
     if not message.text:
@@ -432,13 +637,11 @@ async def handle_code(message: types.Message) -> None:
             parse_mode="Markdown"
         )
 
-
 # ---------- ЗАПУСК: WEBHOOK или POLLING ----------
 WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/webhook")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # https://<app>.onrender.com/webhook
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "change-me")
 PORT = int(os.getenv("PORT", "10000"))
-
 
 async def _on_startup(app: web.Application):
     await init_db()
@@ -448,7 +651,6 @@ async def _on_startup(app: web.Application):
         logger.info("Webhook установлен: %s", WEBHOOK_URL)
     else:
         logger.info("WEBHOOK_URL не задан — будет POLLING при локальном запуске.")
-
 
 async def _on_shutdown(app: web.Application):
     try:
@@ -461,7 +663,6 @@ async def _on_shutdown(app: web.Application):
         await POOL.close()
         POOL = None
 
-
 async def _process_update_async(data: dict) -> None:
     try:
         update = types.Update.model_validate(data)
@@ -469,10 +670,8 @@ async def _process_update_async(data: dict) -> None:
     except Exception as e:
         logger.exception("Ошибка обработки апдейта: %s", e)
 
-
 def create_app() -> web.Application:
     app = web.Application()
-
     async def health(_):
         return web.Response(text="ok")
     app.router.add_get("/health", health)
@@ -484,15 +683,12 @@ def create_app() -> web.Application:
             data = await request.json()
         except Exception:
             return web.Response(status=400, text="bad json")
-
         asyncio.create_task(_process_update_async(data))
         return web.Response(text="ok")
 
     app.router.add_post(WEBHOOK_PATH, telegram_webhook)
-
     setup_application(app, dp, bot=bot, on_startup=[_on_startup], on_shutdown=[_on_shutdown])
     return app
-
 
 async def _run_polling():
     await init_db()
@@ -505,7 +701,6 @@ async def _run_polling():
         if POOL:
             await POOL.close()
             POOL = None
-
 
 if __name__ == "__main__":
     if WEBHOOK_URL:
