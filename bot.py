@@ -81,37 +81,27 @@ def _get_dsn() -> str:
     if not raw:
         raise RuntimeError("DATABASE_URL/DB_URL is not set in config")
 
-    # убрать возможные переноси/пробелы
     raw = raw.replace("\n", "").replace("\r", "").strip()
-
     u = urlparse(raw)
     if u.scheme not in ("postgresql", "postgres"):
         raise RuntimeError("DATABASE_URL must start with postgresql:// or postgres://")
 
-    # query -> dict
     q = dict(parse_qsl(u.query, keep_blank_values=True))
-
-    # sslmode=require
     q["sslmode"] = "require"
 
     host = u.hostname or ""
     port = u.port or 5432
-
-    # Для Supabase используем 6543 (transaction pooler, IPv4‑friendly)
     if (".supabase.co" in host or ".supabase.net" in host) and port == 5432:
         port = 6543
 
-    # Разрешаем домен строго в IPv4 и кладём в hostaddr
     try:
         infos = socket.getaddrinfo(host, port, family=socket.AF_INET, type=socket.SOCK_STREAM)
         if infos:
             ipv4 = infos[0][4][0]
             q["hostaddr"] = ipv4
     except Exception:
-        # если не вышло — идём как есть
         pass
 
-    # пересобираем netloc с сохранением userinfo
     userinfo = ""
     if u.username:
         userinfo = u.username
@@ -135,7 +125,6 @@ async def init_db() -> None:
             kwargs={"autocommit": True},
             timeout=30,
         )
-        # Явно открываем пул, чтобы ошибка соединения проявилась сразу
         await POOL.open(wait=True)
 
     async with POOL.connection() as conn:
@@ -157,7 +146,6 @@ async def set_bot_commands() -> None:
 
 # ---------- ЛОГИКА ----------
 async def ensure_user(user_id: int, username: str | None, first_name: str | None) -> str:
-    """Убедиться, что пользователь есть в users и имеет постоянный participant_code. Вернёт participant_code."""
     await init_db()
     async with POOL.connection() as conn:  # type: ignore[union-attr]
         async with conn.cursor(row_factory=tuple_row) as cur:
@@ -185,7 +173,6 @@ async def ensure_user(user_id: int, username: str | None, first_name: str | None
 
 
 async def register_entry(user_id: int, username: str | None, first_name: str | None, code: str) -> tuple[int, bool, str]:
-    """Зарегистрировать код для пользователя. Возвращает (entry_number, is_new, participant_code)."""
     await init_db()
     participant_code = await ensure_user(user_id, username, first_name)
 
@@ -211,7 +198,6 @@ async def register_entry(user_id: int, username: str | None, first_name: str | N
 
 
 async def get_user_entries(user_id: int) -> tuple[str, list[tuple[str, int]]]:
-    """Вернёт (participant_code, [(code, entry_number), ...])"""
     await init_db()
     async with POOL.connection() as conn:  # type: ignore[union-attr]
         async with conn.cursor(row_factory=tuple_row) as cur:
@@ -247,7 +233,6 @@ async def export_csv() -> bytes:
 
 
 async def draw_weighted_winner() -> dict | None:
-    """Взвешенный победитель: билеты = кол-ву уникальных кодов."""
     await init_db()
     async with POOL.connection() as conn:  # type: ignore[union-attr]
         async with conn.cursor(row_factory=tuple_row) as cur:
@@ -447,6 +432,15 @@ async def _on_shutdown(app: web.Application):
         POOL = None
 
 
+async def _process_update_async(data: dict) -> None:
+    """Фоновая обработка апдейта, чтобы вебхук отвечал мгновенно."""
+    try:
+        update = types.Update.model_validate(data)
+        await dp.feed_update(bot, update)
+    except Exception as e:
+        logger.exception("Ошибка обработки апдейта: %s", e)
+
+
 def create_app() -> web.Application:
     app = web.Application()
 
@@ -455,21 +449,16 @@ def create_app() -> web.Application:
     app.router.add_get("/health", health)
 
     async def telegram_webhook(request: web.Request) -> web.Response:
-        if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != WEBHOOK_SECRET:
+        # Проверяем секрет только если он задан (не пуст)
+        if WEBHOOK_SECRET and request.headers.get("X-Telegram-Bot-Api-Secret-Token") != WEBHOOK_SECRET:
             return web.Response(status=403, text="forbidden")
         try:
             data = await request.json()
         except Exception:
             return web.Response(status=400, text="bad json")
 
-        try:
-            await init_db()
-            update = types.Update.model_validate(data)
-            await dp.feed_update(bot, update)
-        except Exception as e:
-            logger.exception("Ошибка обработки webhook: %s", e)
-            return web.Response(text="ok")
-
+        # Отвечаем Telegram сразу, обработку запускаем в фоне
+        asyncio.create_task(_process_update_async(data))
         return web.Response(text="ok")
 
     app.router.add_post(WEBHOOK_PATH, telegram_webhook)
