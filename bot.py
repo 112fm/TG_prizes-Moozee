@@ -208,7 +208,6 @@ def channel_url() -> str:
     return f"https://t.me/{REQ_CH_USERNAME}" if REQ_CH_USERNAME else "https://t.me/"
 
 def not_subscribed_kb(code_lc: str) -> InlineKeyboardMarkup:
-    # URL на канал + кнопка проверки
     kb = [
         [InlineKeyboardButton(text="→ Открыть канал", url=channel_url())],
         [InlineKeyboardButton(text="✅ Подписался, проверить", callback_data=f"subchk:{code_lc}")],
@@ -218,9 +217,7 @@ def not_subscribed_kb(code_lc: str) -> InlineKeyboardMarkup:
 
 # ---------- ПРОВЕРКА ПОДПИСКИ ----------
 async def is_subscribed(user_id: int) -> bool:
-    """Проверяем подписку на канал по username (если есть) и/или по chat_id."""
     ok_status = {"member", "administrator", "creator"}
-    # По username (если задан)
     if REQ_CH_USERNAME:
         try:
             m = await bot.get_chat_member(chat_id=f"@{REQ_CH_USERNAME}", user_id=user_id)
@@ -228,7 +225,6 @@ async def is_subscribed(user_id: int) -> bool:
                 return True
         except Exception as e:
             logger.info("get_chat_member by username failed: %s", e)
-    # По числовому ID
     try:
         m = await bot.get_chat_member(chat_id=REQ_CH_ID, user_id=user_id)
         return m.status in ok_status
@@ -253,7 +249,6 @@ async def ensure_user(user_id: int, username: str | None, first_name: str | None
                                       values (%s) on conflict (user_id) do nothing""", (user_id,))
                 return row[0]
 
-        # новый participant_code
         while True:
             pc = make_participant_code()
             async with conn.cursor(row_factory=tuple_row) as cur:
@@ -466,31 +461,31 @@ def prefs_keyboard(prefs: Dict[str, bool]) -> types.InlineKeyboardMarkup:
 async def cmd_start(message: types.Message) -> None:
     pcode = await ensure_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
     text = (
-        "👋 Йо, ты в Moozee_Movie Prizes — тут скины не падают, тут их вырывают.\n"
-        "Хочешь шанс? Всё просто:\n"
-        "1️⃣ Находишь кодовое слово в видосе.\n"
-        "2️⃣ Вводишь его сюда.\n"
-        "3️⃣ Бот даёт тебе номер, и ты попадаешь в список розыгрыша.\n\n"
+        "👋 Йо, ты в Moozee_Movie Prizes — тут скины не падают, тут их вырывают.<br/>"
+        "Хочешь шанс? Всё просто:<br/>"
+        "1️⃣ Находишь кодовое слово в видосе.<br/>"
+        "2️⃣ Вводишь его сюда.<br/>"
+        "3️⃣ Бот даёт тебе номер, и ты попадаешь в список розыгрыша.<br/><br/>"
         "⚠️ Но номер получают только те, кто подписан на наш Telegram‑канал 👉 "
-        f"@{REQ_CH_USERNAME}\n"
-        "Игра честная: без подписки — без шанса.\n\n"
-        "Ну что, готов проверить удачу?\n\n"
-        f"Твой постоянный ID участника: `{pcode}`\n"
+        f"<a href=\"https://t.me/{REQ_CH_USERNAME}\">@{REQ_CH_USERNAME}</a><br/>"
+        "Игра честная: без подписки — без шанса.<br/><br/>"
+        "Ну что, готов проверить удачу?<br/><br/>"
+        f"Твой постоянный ID участника: <code>{pcode}</code><br/>"
         "Команды: /my — твои коды, /prefs — уведомления."
     )
-    await message.answer(text, parse_mode="Markdown")
+    await message.answer(text, parse_mode="HTML")
 
 
 @dp.message(Command("my"))
 async def cmd_my(message: types.Message) -> None:
     pcode, entries = await get_user_entries(message.from_user.id)
     if not entries:
-        await message.answer(f"Твой ID: `{pcode}`\nТы ещё не вводил кодовые слова.", parse_mode="Markdown")
+        await message.answer(f"Твой ID: <code>{pcode}</code>\nТы ещё не вводил кодовые слова.", parse_mode="HTML")
         return
-    lines = [f"Твой ID: `{pcode}`", "Твои коды:"]
+    lines = [f"Твой ID: <code>{pcode}</code>", "Твои коды:"]
     for code, number in entries:
         lines.append(f"№{number} — {code}")
-    await message.answer("\n".join(lines), parse_mode="Markdown")
+    await message.answer("\n".join(lines), parse_mode="HTML")
 
 
 @dp.message(Command("prefs"))
@@ -539,17 +534,17 @@ async def cmd_draw(message: types.Message) -> None:
     uname = f"@{winner['username']}" if winner["username"] else f"user_id={winner['user_id']}"
     codes_list = ", ".join(winner["codes"]) if winner["codes"] else "—"
     text = (
-        "🎉 *Победитель розыгрыша!*\n"
-        f"Игрок: *{winner['first_name']}* ({uname})\n"
-        f"ID участника: `{winner['participant_code']}`\n"
-        f"Найдено кодов: *{winner['codes_count']}* (вес)\n"
+        "🎉 <b>Победитель розыгрыша!</b>\n"
+        f"Игрок: <b>{winner['first_name']}</b> ({uname})\n"
+        f"ID участника: <code>{winner['participant_code']}</code>\n"
+        f"Найдено кодов: <b>{winner['codes_count']}</b> (вес)\n"
         f"Коды: {codes_list}"
     )
-    await message.answer(text, parse_mode="Markdown")
+    await message.answer(text, parse_mode="HTML")
 
     if getattr(config, "GROUP_CHAT_ID", None):
         try:
-            await bot.send_message(config.GROUP_CHAT_ID, text, parse_mode="Markdown")
+            await bot.send_message(config.GROUP_CHAT_ID, text, parse_mode="HTML")
         except Exception as e:
             logger.warning("Не удалось отправить анонс в группу: %s", e)
 
@@ -602,13 +597,13 @@ async def cb_admin_draw(cb: CallbackQuery):
         uname = f"@{winner['username']}" if winner["username"] else f"user_id={winner['user_id']}"
         codes_list = ", ".join(winner["codes"]) if winner["codes"] else "—"
         text = (
-            "🎉 *Победитель розыгрыша!*\n"
-            f"Игрок: *{winner['first_name']}* ({uname})\n"
-            f"ID участника: `{winner['participant_code']}`\n"
-            f"Найдено кодов: *{winner['codes_count']}*\n"
+            "🎉 <b>Победитель розыгрыша!</b>\n"
+            f"Игрок: <b>{winner['first_name']}</b> ({uname})\n"
+            f"ID участника: <code>{winner['participant_code']}</code>\n"
+            f"Найдено кодов: <b>{winner['codes_count']}</b>\n"
             f"Коды: {codes_list}"
         )
-        await cb.message.answer(text, parse_mode="Markdown")
+        await cb.message.answer(text, parse_mode="HTML")
     except Exception as e:
         logger.exception("Ошибка розыгрыша: %s", e)
         await cb.message.answer(f"Ошибка розыгрыша: {e}")
@@ -682,7 +677,7 @@ async def _send_broadcast(btype: str, text: str, admin_chat_id: int):
             failed += 1
             if failed <= 5:
                 logger.warning("Не доставлено %s: %s", uid, e)
-        await asyncio.sleep(0.05)  # ~20 msg/сек
+        await asyncio.sleep(0.05)
     await bot.send_message(
         admin_chat_id,
         f"Готово.\nТип: {btype}\nВсего получателей: {len(subs)}\nДоставлено: {sent}\nОшибок: {failed}"
@@ -703,8 +698,8 @@ async def cb_broadcast_confirm(cb: CallbackQuery, state: FSMContext):
 
 # ---------- ПРИЁМ КОДОВ + ПРОВЕРКА ПОДПИСКИ ----------
 UNSUB_TEXT = (
-    "Эй, халявы не будет. Только свои забирают скины.\n"
-    f"Подпишись на 👉 @{REQ_CH_USERNAME}\n"
+    "Эй, халявы не будет. Только свои забирают скины.<br/>"
+    f"Подпишись на 👉 <a href=\"https://t.me/{REQ_CH_USERNAME}\">@{REQ_CH_USERNAME}</a><br/>"
     "и жми «✅ Подписался, проверить»."
 )
 
@@ -722,13 +717,11 @@ async def handle_code(message: types.Message) -> None:
         await message.answer("Кодовое слово неверно. Попробуй ещё раз.")
         return
 
-    # проверяем подписку
     if not await is_subscribed(message.from_user.id):
         await ensure_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
-        await message.answer(UNSUB_TEXT, reply_markup=not_subscribed_kb(code_lc))
+        await message.answer(UNSUB_TEXT, reply_markup=not_subscribed_kb(code_lc), parse_mode="HTML")
         return
 
-    # подписан — сразу записываем
     entry_number, is_new, pcode = await register_entry(
         user_id=message.from_user.id,
         username=message.from_user.username,
@@ -737,18 +730,17 @@ async def handle_code(message: types.Message) -> None:
     )
     if is_new:
         await message.answer(
-            f"Принято! Твой постоянный ID: `{pcode}`\nТы участник №{entry_number} в розыгрыше.",
-            parse_mode="Markdown"
+            f"Принято! Твой постоянный ID: <code>{pcode}</code>\nТы участник №{entry_number} в розыгрыше.",
+            parse_mode="HTML"
         )
     else:
         await message.answer(
-            f"Этот код уже зарегистрирован за тобой как №{entry_number}.\nТвой ID: `{pcode}`",
-            parse_mode="Markdown"
+            f"Этот код уже зарегистрирован за тобой как №{entry_number}.\nТвой ID: <code>{pcode}</code>",
+            parse_mode="HTML"
         )
 
 @dp.callback_query(F.data.startswith("subchk:"))
 async def cb_check_sub(cb: CallbackQuery):
-    # мгновенно убираем спиннер
     await cb.answer("Проверяю…")
     code_lc = cb.data.split(":", 1)[1]
     valid_codes = [c.lower() for c in config.VALID_CODES]
@@ -756,12 +748,13 @@ async def cb_check_sub(cb: CallbackQuery):
         return await cb.message.answer("Кодовое слово устарело или неверно.")
 
     if not await is_subscribed(cb.from_user.id):
-        # всё ещё нет подписки
-        await cb.message.answer("Ты ещё не подписан. Подпишись и жми «✅ Подписался, проверить».",
-                                reply_markup=not_subscribed_kb(code_lc))
+        await cb.message.answer(
+            "Ты ещё не подписан. Подпишись и жми «✅ Подписался, проверить».",
+            reply_markup=not_subscribed_kb(code_lc),
+            parse_mode="HTML"
+        )
         return
 
-    # теперь подписан — записываем участие
     entry_number, is_new, pcode = await register_entry(
         user_id=cb.from_user.id,
         username=cb.from_user.username,
@@ -770,26 +763,21 @@ async def cb_check_sub(cb: CallbackQuery):
     )
     if is_new:
         await cb.message.answer(
-            f"Отлично! Подписка есть ✅\n"
-            f"Твой ID: `{pcode}`\n"
-            f"Ты участник №{entry_number} в розыгрыше.",
-            parse_mode="Markdown"
+            f"Отлично! Подписка есть ✅\nТвой ID: <code>{pcode}</code>\nТы участник №{entry_number} в розыгрыше.",
+            parse_mode="HTML"
         )
     else:
         await cb.message.answer(
-            f"Подписка подтверждена ✅\n"
-            f"Этот код уже был за тобой как №{entry_number}.\n"
-            f"Твой ID: `{pcode}`",
-            parse_mode="Markdown"
+            f"Подписка подтверждена ✅\nЭтот код уже был за тобой как №{entry_number}.\nТвой ID: <code>{pcode}</code>",
+            parse_mode="HTML"
         )
 
 
 # ---------- ЗАПУСК: WEBHOOK или POLLING ----------
 WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/webhook")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # пример: https://<app>.onrender.com/webhook
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "change-me")
 PORT = int(os.getenv("PORT", "10000"))
-
 
 async def _on_startup(app: web.Application):
     await init_db()
@@ -799,7 +787,6 @@ async def _on_startup(app: web.Application):
         logger.info("Webhook установлен: %s", WEBHOOK_URL)
     else:
         logger.info("WEBHOOK_URL не задан — будет POLLING при локальном запуске.")
-
 
 async def _on_shutdown(app: web.Application):
     try:
@@ -812,7 +799,6 @@ async def _on_shutdown(app: web.Application):
         await POOL.close()
         POOL = None
 
-
 async def _process_update_async(data: dict) -> None:
     try:
         update = types.Update.model_validate(data)
@@ -820,10 +806,8 @@ async def _process_update_async(data: dict) -> None:
     except Exception as e:
         logger.exception("Ошибка обработки апдейта: %s", e)
 
-
 def create_app() -> web.Application:
     app = web.Application()
-
     async def health(_):
         return web.Response(text="ok")
     app.router.add_get("/health", health)
@@ -835,15 +819,12 @@ def create_app() -> web.Application:
             data = await request.json()
         except Exception:
             return web.Response(status=400, text="bad json")
-
         asyncio.create_task(_process_update_async(data))
         return web.Response(text="ok")
 
     app.router.add_post(WEBHOOK_PATH, telegram_webhook)
-
     setup_application(app, dp, bot=bot, on_startup=[_on_startup], on_shutdown=[_on_shutdown])
     return app
-
 
 async def _run_polling():
     await init_db()
@@ -856,7 +837,6 @@ async def _run_polling():
         if POOL:
             await POOL.close()
             POOL = None
-
 
 if __name__ == "__main__":
     if WEBHOOK_URL:
