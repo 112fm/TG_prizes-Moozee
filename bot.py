@@ -391,7 +391,7 @@ def prefs_keyboard(prefs: Dict[str, bool]) -> types.InlineKeyboardMarkup:
     return kb.as_markup()
 
 @dp.message(Command("start"))
-async def cmd_start(message: types.Message) -> None:
+sync def cmd_start(message: types.Message) -> None:
     pcode = await ensure_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
     text = (
         "👋 Йо, ты в Moozee_Movie Prizes — тут скины не падают, тут их вырывают.\n"
@@ -400,7 +400,8 @@ async def cmd_start(message: types.Message) -> None:
         "2️⃣ Вводишь его сюда.\n"
         "3️⃣ Бот даёт тебе номер, и ты попадаешь в список розыгрыша.\n\n"
         "⚠️ Но номер получают только те, кто подписан на наш Telegram‑канал 👉 "
-        f"<a href=\"https://t.me/{REQ_CH_USERNAME}\">@{REQ_CH_USERNAME}</a>\n"
+        # ВАЖНО: ссылка внутрителеграмная, а не https
+        f"<a href=\"tg://resolve?domain={REQ_CH_USERNAME}\">@{REQ_CH_USERNAME}</a>\n"
         "Игра честная: без подписки — без шанса.\n\n"
         "Ну что, готов проверить удачу?\n\n"
         f"Твой постоянный ID участника: <code>{pcode}</code>\n"
@@ -609,7 +610,7 @@ async def cb_broadcast_confirm(cb: CallbackQuery, state: FSMContext):
 
 UNSUB_TEXT = (
     "Эй, халявы не будет. Только свои забирают скины.\n"
-    f"Подпишись на 👉 <a href=\"https://t.me/{REQ_CH_USERNAME}\">@{REQ_CH_USERNAME}</a>\n"
+    f"Подпишись на 👉 <a href=\"tg://resolve?domain={REQ_CH_USERNAME}\">@{REQ_CH_USERNAME}</a>\n"
     "и жми «✅ Подписался, проверить»."
 )
 
