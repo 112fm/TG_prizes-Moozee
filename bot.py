@@ -391,7 +391,7 @@ def prefs_keyboard(prefs: Dict[str, bool]) -> types.InlineKeyboardMarkup:
     return kb.as_markup()
 
 @dp.message(Command("start"))
-sync def cmd_start(message: types.Message) -> None:
+async def cmd_start(message: types.Message) -> None:
     pcode = await ensure_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
     text = (
         "👋 Йо, ты в Moozee_Movie Prizes — тут скины не падают, тут их вырывают.\n"
