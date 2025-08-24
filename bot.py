@@ -26,6 +26,8 @@ from aiogram.types import (
     CallbackQuery,
     BotCommandScopeAllPrivateChats,
     BotCommandScopeChat,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.fsm.state import StatesGroup, State
@@ -53,6 +55,10 @@ bot = Bot(token=config.BOT_TOKEN)
 # ---------- КОНФИГ ----------
 PART_LEN = config.PARTICIPANT_CODE_LEN
 ALPHABET = config.PARTICIPANT_CODE_ALPHABET
+
+# Требуемая подписка
+REQ_CH_USERNAME = os.getenv("REQUIRED_CHANNEL_USERNAME", "projectglml").lstrip("@")
+REQ_CH_ID = int(os.getenv("REQUIRED_CHANNEL_ID", "-1002675692681"))
 
 # ---------- ПУЛ ПОДКЛЮЧЕНИЙ К БД ----------
 POOL: AsyncConnectionPool | None = None
@@ -175,7 +181,7 @@ async def init_db() -> None:
 
 # ---------- КОМАНДЫ / МЕНЮ ----------
 async def set_bot_commands() -> None:
-    # Базовые команды — всем в личке
+    # Базовые — всем
     base_cmds = [
         BotCommand(command="start", description="Начать"),
         BotCommand(command="my", description="Мои коды"),
@@ -183,7 +189,7 @@ async def set_bot_commands() -> None:
     ]
     await bot.set_my_commands(base_cmds, scope=BotCommandScopeAllPrivateChats())
 
-    # Расширенные — только конкретным админам
+    # Админские — только админам
     admin_cmds = base_cmds + [
         BotCommand(command="admin", description="Админ‑панель"),
         BotCommand(command="export", description="Выгрузить CSV"),
@@ -195,6 +201,40 @@ async def set_bot_commands() -> None:
             await bot.set_my_commands(admin_cmds, scope=BotCommandScopeChat(chat_id=admin_id))
         except Exception as e:
             logger.warning("Не удалось назначить команды для админа %s: %s", admin_id, e)
+
+
+# ---------- ПОЛЕЗНЫЕ КНОПКИ ----------
+def channel_url() -> str:
+    return f"https://t.me/{REQ_CH_USERNAME}" if REQ_CH_USERNAME else "https://t.me/"
+
+def not_subscribed_kb(code_lc: str) -> InlineKeyboardMarkup:
+    # URL на канал + кнопка проверки
+    kb = [
+        [InlineKeyboardButton(text="→ Открыть канал", url=channel_url())],
+        [InlineKeyboardButton(text="✅ Подписался, проверить", callback_data=f"subchk:{code_lc}")],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+
+
+# ---------- ПРОВЕРКА ПОДПИСКИ ----------
+async def is_subscribed(user_id: int) -> bool:
+    """Проверяем подписку на канал по username (если есть) и/или по chat_id."""
+    ok_status = {"member", "administrator", "creator"}
+    # По username (если задан)
+    if REQ_CH_USERNAME:
+        try:
+            m = await bot.get_chat_member(chat_id=f"@{REQ_CH_USERNAME}", user_id=user_id)
+            if m.status in ok_status:
+                return True
+        except Exception as e:
+            logger.info("get_chat_member by username failed: %s", e)
+    # По числовому ID
+    try:
+        m = await bot.get_chat_member(chat_id=REQ_CH_ID, user_id=user_id)
+        return m.status in ok_status
+    except Exception as e:
+        logger.info("get_chat_member by id failed: %s", e)
+        return False
 
 
 # ---------- ЛОГИКА УЧАСТНИКОВ/КОДОВ ----------
@@ -426,12 +466,17 @@ def prefs_keyboard(prefs: Dict[str, bool]) -> types.InlineKeyboardMarkup:
 async def cmd_start(message: types.Message) -> None:
     pcode = await ensure_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
     text = (
-        f"Привет, {message.from_user.first_name or 'друг'} 👋\n\n"
-        "Отправь кодовое слово, чтобы участвовать в розыгрыше.\n"
-        "Чем больше найденных кодов (до 3), тем выше шанс при розыгрыше.\n\n"
+        "👋 Йо, ты в Moozee_Movie Prizes — тут скины не падают, тут их вырывают.\n"
+        "Хочешь шанс? Всё просто:\n"
+        "1️⃣ Находишь кодовое слово в видосе.\n"
+        "2️⃣ Вводишь его сюда.\n"
+        "3️⃣ Бот даёт тебе номер, и ты попадаешь в список розыгрыша.\n\n"
+        "⚠️ Но номер получают только те, кто подписан на наш Telegram‑канал 👉 "
+        f"@{REQ_CH_USERNAME}\n"
+        "Игра честная: без подписки — без шанса.\n\n"
+        "Ну что, готов проверить удачу?\n\n"
         f"Твой постоянный ID участника: `{pcode}`\n"
-        "Посмотреть свои коды: /my\n"
-        "Настроить уведомления: /prefs"
+        "Команды: /my — твои коды, /prefs — уведомления."
     )
     await message.answer(text, parse_mode="Markdown")
 
@@ -467,7 +512,6 @@ async def cb_prefs_toggle(cb: CallbackQuery):
 @dp.message(Command("admin"))
 async def cmd_admin(message: types.Message) -> None:
     if not is_admin(message.from_user.id):
-        # обычным не показываем ничего лишнего
         return
     await message.answer("Админ‑панель:", reply_markup=admin_keyboard())
 
@@ -476,7 +520,6 @@ async def cmd_admin(message: types.Message) -> None:
 async def cmd_export(message: types.Message) -> None:
     if not is_admin(message.from_user.id):
         return
-    # быстрая квитанция, чтобы не было спиннера
     await message.answer("Готовлю CSV…")
     csv_bytes = await export_csv()
     file = BufferedInputFile(csv_bytes, filename="participants.csv")
@@ -537,7 +580,7 @@ async def cmd_stats(message: types.Message) -> None:
 async def cb_admin_export(cb: CallbackQuery):
     if not is_admin(cb.from_user.id):
         return await cb.answer("Недоступно", show_alert=True)
-    await cb.answer("Готовлю CSV…")  # мгновенный ответ, чтобы убрать спиннер
+    await cb.answer("Готовлю CSV…")
     try:
         csv_bytes = await export_csv()
         file = BufferedInputFile(csv_bytes, filename="participants.csv")
@@ -572,6 +615,10 @@ async def cb_admin_draw(cb: CallbackQuery):
 
 
 # ---------- РАССЫЛКИ ----------
+class BroadcastState(StatesGroup):
+    btype = State()
+    text = State()
+
 @dp.callback_query(F.data.startswith("admin:broadcast:"))
 async def cb_admin_broadcast(cb: CallbackQuery, state: FSMContext):
     if not is_admin(cb.from_user.id):
@@ -580,19 +627,17 @@ async def cb_admin_broadcast(cb: CallbackQuery, state: FSMContext):
     await state.set_state(BroadcastState.btype)
     await state.update_data(btype=btype)
     await state.set_state(BroadcastState.text)
-    await cb.answer("Ок")  # убрать спиннер
+    await cb.answer("Ок")
     await cb.message.answer(
         "Пришли текст сообщения для рассылки (можно с ссылками). "
         "После этого я покажу, сколько получателей, и попрошу подтверждение.\n\n"
         "Чтобы отменить — /cancel"
     )
 
-
 @dp.message(Command("cancel"))
 async def cmd_cancel(message: types.Message, state: FSMContext):
     await state.clear()
     await message.answer("Ок, отменил.")
-
 
 @dp.message(BroadcastState.text)
 async def broadcast_collect_text(message: types.Message, state: FSMContext):
@@ -616,20 +661,17 @@ async def broadcast_collect_text(message: types.Message, state: FSMContext):
         reply_markup=kb.as_markup(),
     )
 
-
 @dp.callback_query(F.data == "broadcast:cancel")
 async def cb_broadcast_cancel(cb: CallbackQuery, state: FSMContext):
     await state.clear()
     await cb.answer("Отменено")
     await cb.message.answer("Рассылка отменена.")
 
-
 async def _send_broadcast(btype: str, text: str, admin_chat_id: int):
     subs = await list_subscribers_for(btype)
     if not subs:
         await bot.send_message(admin_chat_id, "Получателей нет. Рассылка не отправлена.")
         return
-
     sent = 0
     failed = 0
     for uid in subs:
@@ -641,12 +683,10 @@ async def _send_broadcast(btype: str, text: str, admin_chat_id: int):
             if failed <= 5:
                 logger.warning("Не доставлено %s: %s", uid, e)
         await asyncio.sleep(0.05)  # ~20 msg/сек
-
     await bot.send_message(
         admin_chat_id,
         f"Готово.\nТип: {btype}\nВсего получателей: {len(subs)}\nДоставлено: {sent}\nОшибок: {failed}"
     )
-
 
 @dp.callback_query(F.data == "broadcast:confirm")
 async def cb_broadcast_confirm(cb: CallbackQuery, state: FSMContext):
@@ -656,12 +696,18 @@ async def cb_broadcast_confirm(cb: CallbackQuery, state: FSMContext):
     btype = data.get("btype", "video")
     text = data.get("text", "")
     await state.clear()
-    await cb.answer("Отправляю…")  # мгновенный ответ
+    await cb.answer("Отправляю…")
     await cb.message.answer("Стартую рассылку… Отчёт пришлю сюда.")
     asyncio.create_task(_send_broadcast(btype=btype, text=text, admin_chat_id=cb.from_user.id))
 
 
-# ---------- ПРИЁМ КОДОВ ----------
+# ---------- ПРИЁМ КОДОВ + ПРОВЕРКА ПОДПИСКИ ----------
+UNSUB_TEXT = (
+    "Эй, халявы не будет. Только свои забирают скины.\n"
+    f"Подпишись на 👉 @{REQ_CH_USERNAME}\n"
+    "и жми «✅ Подписался, проверить»."
+)
+
 @dp.message()
 async def handle_code(message: types.Message) -> None:
     if not message.text:
@@ -669,16 +715,25 @@ async def handle_code(message: types.Message) -> None:
     txt = message.text.strip()
     if not txt or txt.startswith("/"):
         return
-    code = txt.lower()
+
+    code_lc = txt.lower()
     valid_codes = [c.lower() for c in config.VALID_CODES]
-    if code not in valid_codes:
-        await message.answer("Кодовое слово неверно. Попробуйте ещё раз.")
+    if code_lc not in valid_codes:
+        await message.answer("Кодовое слово неверно. Попробуй ещё раз.")
         return
+
+    # проверяем подписку
+    if not await is_subscribed(message.from_user.id):
+        await ensure_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
+        await message.answer(UNSUB_TEXT, reply_markup=not_subscribed_kb(code_lc))
+        return
+
+    # подписан — сразу записываем
     entry_number, is_new, pcode = await register_entry(
         user_id=message.from_user.id,
         username=message.from_user.username,
         first_name=message.from_user.first_name,
-        code=code,
+        code=code_lc,
     )
     if is_new:
         await message.answer(
@@ -688,6 +743,43 @@ async def handle_code(message: types.Message) -> None:
     else:
         await message.answer(
             f"Этот код уже зарегистрирован за тобой как №{entry_number}.\nТвой ID: `{pcode}`",
+            parse_mode="Markdown"
+        )
+
+@dp.callback_query(F.data.startswith("subchk:"))
+async def cb_check_sub(cb: CallbackQuery):
+    # мгновенно убираем спиннер
+    await cb.answer("Проверяю…")
+    code_lc = cb.data.split(":", 1)[1]
+    valid_codes = [c.lower() for c in config.VALID_CODES]
+    if code_lc not in valid_codes:
+        return await cb.message.answer("Кодовое слово устарело или неверно.")
+
+    if not await is_subscribed(cb.from_user.id):
+        # всё ещё нет подписки
+        await cb.message.answer("Ты ещё не подписан. Подпишись и жми «✅ Подписался, проверить».",
+                                reply_markup=not_subscribed_kb(code_lc))
+        return
+
+    # теперь подписан — записываем участие
+    entry_number, is_new, pcode = await register_entry(
+        user_id=cb.from_user.id,
+        username=cb.from_user.username,
+        first_name=cb.from_user.first_name,
+        code=code_lc,
+    )
+    if is_new:
+        await cb.message.answer(
+            f"Отлично! Подписка есть ✅\n"
+            f"Твой ID: `{pcode}`\n"
+            f"Ты участник №{entry_number} в розыгрыше.",
+            parse_mode="Markdown"
+        )
+    else:
+        await cb.message.answer(
+            f"Подписка подтверждена ✅\n"
+            f"Этот код уже был за тобой как №{entry_number}.\n"
+            f"Твой ID: `{pcode}`",
             parse_mode="Markdown"
         )
 
