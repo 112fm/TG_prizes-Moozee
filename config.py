@@ -5,9 +5,7 @@ import re
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
 # 👑 Админы
-# Принимает:
-#  - ADMIN_IDS="1,2,3"
-#  - ADMIN_ID="1,2"  или "1"
+# ADMIN_IDS="1,2,3" или ADMIN_ID="1"
 _admins_raw = (os.getenv("ADMIN_IDS") or os.getenv("ADMIN_ID") or "").strip()
 ADMIN_IDS = sorted({
     int(x)
@@ -15,12 +13,10 @@ ADMIN_IDS = sorted({
     if x.strip().lstrip("-").isdigit()
 })
 
-# 🗃 Старый SQLite (оставлен для совместимости, не используется с PG)
+# 🗃 Старый SQLite (для совместимости; не используется в текущем боте)
 DB_NAME = os.getenv("DB_NAME", "participants.db")
 
-# 🌐 PostgreSQL (Supabase)
-# В приоритете переменная окружения DATABASE_URL.
-# Если её нет — используем дефолт (порт 6543 — Transaction Pooler, IPv4-compatible).
+# 🌐 PostgreSQL (Supabase). Порт 6543 — Transaction Pooler.
 DATABASE_URL = (os.getenv(
     "DATABASE_URL",
     "postgresql://postgres:Energizer_776GF4_SUPABASE@db.foptoqqcyjlbcwpwtecc.supabase.co:6543/postgres?sslmode=require",

@@ -43,10 +43,10 @@ from psycopg.rows import tuple_row
 import config
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("prizes-bot")
 
 dp = Dispatcher(storage=MemoryStorage())
-bot = Bot(token=config.BOT_TOKEN)
+bot = Bot(token=config.BOT_TOKEN, parse_mode="HTML")
 
 PART_LEN = config.PARTICIPANT_CODE_LEN
 ALPHABET = config.PARTICIPANT_CODE_ALPHABET
@@ -446,6 +446,7 @@ def prefs_keyboard(prefs: Dict[str, bool]) -> types.InlineKeyboardMarkup:
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message) -> None:
+    logger.info("/start from user_id=%s", message.from_user.id)
     pcode = await ensure_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
     text = (
         "👋 Йо, ты в Moozee_Movie Prizes — тут скины не падают, тут их вырывают.\n"
@@ -460,23 +461,25 @@ async def cmd_start(message: types.Message) -> None:
         f"Твой постоянный ID участника: <code>{pcode}</code>\n"
         "Команды: /my — твои коды, /prefs — уведомления."
     )
-    await message.answer(text, parse_mode="HTML", disable_web_page_preview=True)
+    await message.answer(text, disable_web_page_preview=True)
 
 
 @dp.message(Command("my"))
 async def cmd_my(message: types.Message) -> None:
+    logger.info("/my from user_id=%s", message.from_user.id)
     pcode, entries = await get_user_entries(message.from_user.id)
     if not entries:
-        await message.answer(f"Твой ID: <code>{pcode}</code>\nТы ещё не вводил кодовые слова.", parse_mode="HTML")
+        await message.answer(f"Твой ID: <code>{pcode}</code>\nТы ещё не вводил кодовые слова.")
         return
     lines = [f"Твой ID: <code>{pcode}</code>", "Твои коды:"]
     for code, number in entries:
         lines.append(f"№{number} — {code}")
-    await message.answer("\n".join(lines), parse_mode="HTML")
+    await message.answer("\n".join(lines))
 
 
 @dp.message(Command("prefs"))
 async def cmd_prefs(message: types.Message) -> None:
+    logger.info("/prefs from user_id=%s", message.from_user.id)
     await ensure_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
     prefs = await get_prefs(message.from_user.id)
     await message.answer("Выбери, какие уведомления получать:", reply_markup=prefs_keyboard(prefs))
@@ -484,6 +487,7 @@ async def cmd_prefs(message: types.Message) -> None:
 
 @dp.callback_query(F.data.startswith("prefs:toggle:"))
 async def cb_prefs_toggle(cb: CallbackQuery):
+    logger.info("prefs toggle %s by user_id=%s", cb.data, cb.from_user.id)
     field = cb.data.split(":", 2)[2]
     prefs = await toggle_pref(cb.from_user.id, field)
     await cb.message.edit_text("Выбери, какие уведомления получать:", reply_markup=prefs_keyboard(prefs))
@@ -493,7 +497,9 @@ async def cb_prefs_toggle(cb: CallbackQuery):
 @dp.message(Command("admin"))
 async def cmd_admin(message: types.Message) -> None:
     if not is_admin(message.from_user.id):
+        logger.info("non-admin tried /admin user_id=%s", message.from_user.id)
         return
+    logger.info("open admin panel user_id=%s", message.from_user.id)
     await message.answer("Админ‑панель:", reply_markup=admin_keyboard())
 
 
@@ -501,6 +507,7 @@ async def cmd_admin(message: types.Message) -> None:
 async def cb_admin_stats(cb: CallbackQuery):
     if not is_admin(cb.from_user.id):
         return await cb.answer("Недоступно", show_alert=True)
+    logger.info("admin:stats by %s", cb.from_user.id)
     await cb.answer("Считаю…")
     await init_db()
     async with POOL.connection() as conn, conn.cursor(row_factory=tuple_row) as cur:  # type: ignore[union-attr]
@@ -510,11 +517,21 @@ async def cb_admin_stats(cb: CallbackQuery):
         unique_users = (await cur.fetchone())[0]
         await cur.execute("select count(distinct code) from public.entries")
         unique_codes = (await cur.fetchone())[0]
+        # Новое: статистика подписок на уведомления
+        await cur.execute("select count(*) from public.user_prefs where notify_new_video = true")
+        subs_video = (await cur.fetchone())[0]
+        await cur.execute("select count(*) from public.user_prefs where notify_streams = true")
+        subs_streams = (await cur.fetchone())[0]
+        await cur.execute("select count(*) from public.user_prefs where notify_results = true")
+        subs_results = (await cur.fetchone())[0]
     text = (
         "Статистика:\n"
         f"Всего заявок: {total_entries}\n"
         f"Уникальных пользователей: {unique_users}\n"
-        f"Уникальных кодов: {unique_codes}"
+        f"Уникальных кодов: {unique_codes}\n\n"
+        f"Уведомления — новые видео: {subs_video}\n"
+        f"Уведомления — стримы: {subs_streams}\n"
+        f"Уведомления — результаты: {subs_results}"
     )
     await cb.message.answer(text)
 
@@ -523,6 +540,7 @@ async def cb_admin_stats(cb: CallbackQuery):
 async def cmd_export(message: types.Message) -> None:
     if not is_admin(message.from_user.id):
         return
+    logger.info("admin export by %s", message.from_user.id)
     await message.answer("Готовлю CSV…")
     csv_bytes = await export_csv()
     file = BufferedInputFile(csv_bytes, filename="participants.csv")
@@ -533,6 +551,7 @@ async def cmd_export(message: types.Message) -> None:
 async def cb_admin_export(cb: CallbackQuery):
     if not is_admin(cb.from_user.id):
         return await cb.answer("Недоступно", show_alert=True)
+    logger.info("admin:export by %s", cb.from_user.id)
     await cb.answer("Готовлю CSV…")
     try:
         csv_bytes = await export_csv()
@@ -547,6 +566,7 @@ async def cb_admin_export(cb: CallbackQuery):
 async def cmd_draw(message: types.Message) -> None:
     if not is_admin(message.from_user.id):
         return
+    logger.info("admin draw by %s (message)", message.from_user.id)
     await message.answer("Запускаю розыгрыш…")
     winner = await draw_weighted_winner()
     if not winner:
@@ -562,13 +582,14 @@ async def cmd_draw(message: types.Message) -> None:
         f"Найдено кодов: <b>{winner['codes_count']}</b> (вес)\n"
         f"Коды: {codes_list}"
     )
-    await message.answer(text, parse_mode="HTML")
+    await message.answer(text)
 
 
 @dp.callback_query(F.data == "admin:draw")
 async def cb_admin_draw(cb: CallbackQuery):
     if not is_admin(cb.from_user.id):
         return await cb.answer("Недоступно", show_alert=True)
+    logger.info("admin draw by %s (callback)", cb.from_user.id)
     await cb.answer("Делаю розыгрыш…")
     try:
         winner = await draw_weighted_winner()
@@ -583,7 +604,7 @@ async def cb_admin_draw(cb: CallbackQuery):
             f"Найдено кодов: <b>{winner['codes_count']}</b>\n"
             f"Коды: {codes_list}"
         )
-        await cb.message.answer(text, parse_mode="HTML")
+        await cb.message.answer(text)
     except Exception as e:
         logger.exception("Ошибка розыгрыша: %s", e)
         await cb.message.answer(f"Ошибка розыгрыша: {e}")
@@ -594,6 +615,7 @@ async def cb_admin_broadcast(cb: CallbackQuery, state: FSMContext):
     if not is_admin(cb.from_user.id):
         return await cb.answer("Недоступно", show_alert=True)
     _, _, btype = cb.data.split(":")
+    logger.info("open broadcast type=%s by %s", btype, cb.from_user.id)
     await state.set_state(BroadcastState.btype)
     await state.update_data(btype=btype)
     await state.set_state(BroadcastState.text)
@@ -607,6 +629,7 @@ async def cb_admin_broadcast(cb: CallbackQuery, state: FSMContext):
 
 @dp.message(Command("cancel"))
 async def cmd_cancel(message: types.Message, state: FSMContext):
+    logger.info("cancel broadcast by %s", message.from_user.id)
     await state.clear()
     await message.answer("Ок, отменил.")
 
@@ -619,6 +642,7 @@ async def broadcast_collect_text(message: types.Message, state: FSMContext):
     btype = data.get("btype", "video")
     text = message.html_text or message.text or ""
     await state.update_data(text=text)
+    logger.info("broadcast preview type=%s by %s", btype, message.from_user.id)
 
     kind_label = {"video": "Новое видео", "streams": "Стрим", "results": "Результаты"}[btype]
     subs = await list_subscribers_for(btype)
@@ -628,14 +652,15 @@ async def broadcast_collect_text(message: types.Message, state: FSMContext):
     kb.adjust(2)
     await message.answer(
         f"Тип: <b>{kind_label}</b>\nПолучателей: <b>{len(subs)}</b>\n\nПредпросмотр:\n{text}",
-        parse_mode="HTML",
         reply_markup=kb.as_markup(),
+        disable_web_page_preview=True,
     )
 
 
 @dp.callback_query(F.data == "broadcast:cancel")
 async def cb_broadcast_cancel(cb: CallbackQuery, state: FSMContext):
     await state.clear()
+    logger.info("broadcast cancelled by %s", cb.from_user.id)
     await cb.answer("Отменено")
     await cb.message.answer("Рассылка отменена.")
 
@@ -647,15 +672,18 @@ async def _send_broadcast(btype: str, text: str, admin_chat_id: int):
         return
     sent = 0
     failed = 0
+    logger.info("broadcast start type=%s recipients=%s", btype, len(subs))
     for uid in subs:
         try:
-            await bot.send_message(uid, text, disable_web_page_preview=False)
+            # ВАЖНО: отключаем превью ссылок
+            await bot.send_message(uid, text, disable_web_page_preview=True)
             sent += 1
         except Exception as e:
             failed += 1
             if failed <= 5:
                 logger.warning("Не доставлено %s: %s", uid, e)
         await asyncio.sleep(0.05)
+    logger.info("broadcast done type=%s sent=%s failed=%s", btype, sent, failed)
     await bot.send_message(
         admin_chat_id,
         f"Готово.\nТип: {btype}\nВсего получателей: {len(subs)}\nДоставлено: {sent}\nОшибок: {failed}"
@@ -670,6 +698,7 @@ async def cb_broadcast_confirm(cb: CallbackQuery, state: FSMContext):
     btype = data.get("btype", "video")
     text = data.get("text", "")
     await state.clear()
+    logger.info("broadcast confirmed type=%s by %s", btype, cb.from_user.id)
     await cb.answer("Отправляю…")
     await cb.message.answer("Стартую рассылку… Отчёт пришлю сюда.")
     asyncio.create_task(_send_broadcast(btype=btype, text=text, admin_chat_id=cb.from_user.id))
@@ -693,12 +722,14 @@ async def handle_code(message: types.Message) -> None:
     code_lc = txt.lower()
     valid_codes = [c.lower() for c in config.VALID_CODES]
     if code_lc not in valid_codes:
+        logger.info("invalid code from user_id=%s text=%s", message.from_user.id, txt)
         await message.answer("Кодовое слово неверно. Попробуй ещё раз.")
         return
 
     if not await is_subscribed(message.from_user.id):
+        logger.info("not subscribed user_id=%s", message.from_user.id)
         await ensure_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
-        await message.answer(UNSUB_TEXT, reply_markup=not_subscribed_kb(code_lc), parse_mode="HTML", disable_web_page_preview=True)
+        await message.answer(UNSUB_TEXT, reply_markup=not_subscribed_kb(code_lc), disable_web_page_preview=True)
         return
 
     entry_number, is_new, pcode = await register_entry(
@@ -708,14 +739,14 @@ async def handle_code(message: types.Message) -> None:
         code=code_lc,
     )
     if is_new:
+        logger.info("entry added user_id=%s code=%s number=%s", message.from_user.id, code_lc, entry_number)
         await message.answer(
-            f"Принято! Твой постоянный ID: <code>{pcode}</code>\nТы участник №{entry_number} в розыгрыше.",
-            parse_mode="HTML"
+            f"Принято! Твой постоянный ID: <code>{pcode}</code>\nТы участник №{entry_number} в розыгрыше."
         )
     else:
+        logger.info("entry duplicate user_id=%s code=%s number=%s", message.from_user.id, code_lc, entry_number)
         await message.answer(
-            f"Этот код уже зарегистрирован за тобой как №{entry_number}.\nТвой ID: <code>{pcode}</code>",
-            parse_mode="HTML"
+            f"Этот код уже зарегистрирован за тобой как №{entry_number}.\nТвой ID: <code>{pcode}</code>"
         )
 
 
@@ -728,10 +759,10 @@ async def cb_check_sub(cb: CallbackQuery):
         return await cb.message.answer("Кодовое слово устарело или неверно.")
 
     if not await is_subscribed(cb.from_user.id):
+        logger.info("sub check: still not subscribed user_id=%s", cb.from_user.id)
         await cb.message.answer(
             "Ты ещё не подписан. Подпишись и жми «✅ Подписался, проверить».",
             reply_markup=not_subscribed_kb(code_lc),
-            parse_mode="HTML",
             disable_web_page_preview=True
         )
         return
@@ -743,14 +774,13 @@ async def cb_check_sub(cb: CallbackQuery):
         code=code_lc,
     )
     if is_new:
+        logger.info("sub check: added after subscribe user_id=%s code=%s", cb.from_user.id, code_lc)
         await cb.message.answer(
-            f"Отлично! Подписка есть ✅\nТвой ID: <code>{pcode}</code>\nТы участник №{entry_number} в розыгрыше.",
-            parse_mode="HTML"
+            f"Отлично! Подписка есть ✅\nТвой ID: <code>{pcode}</code>\nТы участник №{entry_number} в розыгрыше."
         )
     else:
         await cb.message.answer(
-            f"Подписка подтверждена ✅\nЭтот код уже был за тобой как №{entry_number}.\nТвой ID: <code>{pcode}</code>",
-            parse_mode="HTML"
+            f"Подписка подтверждена ✅\nЭтот код уже был за тобой как №{entry_number}.\nТвой ID: <code>{pcode}</code>"
         )
 
 
@@ -806,6 +836,7 @@ def create_app() -> web.Application:
             data = await request.json()
         except Exception:
             return web.Response(status=400, text="bad json")
+        # мгновенный ответ + обработка в фоне
         asyncio.create_task(_process_update_async(data))
         return web.Response(text="ok")
 
