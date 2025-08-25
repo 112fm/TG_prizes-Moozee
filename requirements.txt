@@ -1,9 +1,5 @@
-aiogram==3.22.0
-aiosqlite==0.21.0
+aiogram>=3.7,<4
+aiohttp>=3.9
 
-# Работа с PostgreSQL
 psycopg[binary]>=3.2
 psycopg-pool>=3.2
-
-# Веб
-aiohttp>=3.9

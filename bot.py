@@ -43,11 +43,12 @@ from psycopg.rows import tuple_row
 
 import config
 
+# ---------- ЛОГИ ----------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("prizes-bot")
 
+# ---------- БОТ/DP ----------
 dp = Dispatcher(storage=MemoryStorage())
-# ✅ Новый способ: default=DefaultBotProperties(...)
 bot = Bot(
     token=config.BOT_TOKEN,
     default=DefaultBotProperties(parse_mode="HTML", link_preview_is_disabled=True),
@@ -57,12 +58,13 @@ PART_LEN = config.PARTICIPANT_CODE_LEN
 ALPHABET = config.PARTICIPANT_CODE_ALPHABET
 
 # Канал, на который нужна подписка
-REQ_CH_USERNAME = os.getenv("REQUIRED_CHANNEL_USERNAME", "projectglml").lstrip("@")
-REQ_CH_ID = int(os.getenv("REQUIRED_CHANNEL_ID", "-1002675692681"))
+REQ_CH_USERNAME = (os.getenv("REQUIRED_CHANNEL_USERNAME") or "projectglml").lstrip("@")
+REQ_CH_ID = int(os.getenv("REQUIRED_CHANNEL_ID") or "-1000000000000")  # замени в ENV
 
+# PG pool
 POOL: AsyncConnectionPool | None = None
 
-
+# ---------- УТИЛИТЫ ----------
 def make_participant_code() -> str:
     return "".join(secrets.choice(ALPHABET) for _ in range(PART_LEN))
 
@@ -128,10 +130,11 @@ def _get_dsn() -> str:
 
     host = u.hostname or ""
     port = u.port or 5432
-    # Для Supabase на 5432 — используем 6543 (pooler)
+    # Для Supabase: если 5432 — используем 6543 (pooler)
     if (".supabase.co" in host or ".supabase.net" in host) and port == 5432:
         port = 6543
 
+    # hostaddr (ускоряет соединение на Render)
     hostaddr_env = os.getenv("PGHOSTADDR", "").strip()
     if hostaddr_env:
         q["hostaddr"] = hostaddr_env
@@ -154,10 +157,6 @@ def _get_dsn() -> str:
     new_query = urlencode(q)
     final = urlunparse((u.scheme, netloc, u.path, u.params, new_query, u.fragment))
     logger.info("DB DSN prepared: %s", _mask_url(final))
-    if "hostaddr" in q:
-        logger.info("DB host=%s port=%s hostaddr=%s", host, port, q["hostaddr"])
-    else:
-        logger.info("DB host=%s port=%s (no hostaddr)", host, port)
     return final
 
 
@@ -181,7 +180,8 @@ async def set_bot_commands() -> None:
     base_cmds = [
         BotCommand(command="start", description="Начать"),
         BotCommand(command="my", description="Мои коды"),
-        BotCommand(command="prefs", description="Настройки уведомлений"),
+        BotCommand(command="prefs", description="Уведомления"),
+        BotCommand(command="whoami", description="Мой ID"),
     ]
     await bot.set_my_commands(base_cmds, scope=BotCommandScopeAllPrivateChats())
 
@@ -199,7 +199,6 @@ async def set_bot_commands() -> None:
 
 
 def channel_url() -> str:
-    # используем внутрителеграмную ссылку без web‑превью
     return f"tg://resolve?domain={REQ_CH_USERNAME}" if REQ_CH_USERNAME else "tg://resolve"
 
 
@@ -228,6 +227,7 @@ async def is_subscribed(user_id: int) -> bool:
         return False
 
 
+# ---------- ДАННЫЕ ----------
 async def ensure_user(user_id: int, username: str | None, first_name: str | None) -> str:
     await init_db()
     async with POOL.connection() as conn:  # type: ignore[union-attr]
@@ -421,11 +421,13 @@ async def list_subscribers_for(kind: str) -> List[int]:
     return [int(r[0]) for r in rows]
 
 
+# ---------- FSM ----------
 class BroadcastState(StatesGroup):
     btype = State()
     text = State()
 
 
+# ---------- КЛАВЫ ----------
 def admin_keyboard() -> types.InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.button(text="📥 Экспорт CSV", callback_data="admin:export")
@@ -449,6 +451,13 @@ def prefs_keyboard(prefs: Dict[str, bool]) -> types.InlineKeyboardMarkup:
     return kb.as_markup()
 
 
+# ---------- ХЭНДЛЕРЫ ----------
+@dp.message(Command("whoami"))
+async def cmd_whoami(message: types.Message):
+    await message.answer(f"Твой user_id: <code>{message.from_user.id}</code>\n"
+                         f"Добавь его в ADMIN_IDS через запятую.")
+
+
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message) -> None:
     logger.info("/start from user_id=%s", message.from_user.id)
@@ -459,17 +468,15 @@ async def cmd_start(message: types.Message) -> None:
         "1️⃣ Находишь кодовое слово в видосе.\n"
         "2️⃣ Вводишь его сюда.\n"
         "3️⃣ Бот даёт тебе номер, и ты попадаешь в список розыгрыша.\n\n"
-        "⚠️ Но номер получают только те, кто подписан на наш Telegram‑канал 👉 "
-        f"<a href=\"tg://resolve?domain={REQ_CH_USERNAME}\">@{REQ_CH_USERNAME}</a>\n"
-        "Игра честная: без подписки — без шанса.\n\n"
-        "Ну что, готов проверить удачу?\n\n"
-        f"Твой постоянный ID участника: <code>{pcode}</code>\n"
+        "⚠️ Номер получают только те, кто подписан на канал 👉 "
+        f"<a href=\"tg://resolve?domain={REQ_CH_USERNAME}\">@{REQ_CH_USERNAME}</a>\n\n"
+        f"Твой ID участника: <code>{pcode}</code>\n"
         "Команды: /my — твои коды, /prefs — уведомления."
     )
     await message.answer(text)
 
 
-@dp.message(Command("my"))
+@dp.message(Command("my")))
 async def cmd_my(message: types.Message) -> None:
     logger.info("/my from user_id=%s", message.from_user.id)
     pcode, entries = await get_user_entries(message.from_user.id)
@@ -492,6 +499,9 @@ async def cmd_prefs(message: types.Message) -> None:
 
 @dp.callback_query(F.data.startswith("prefs:toggle:"))
 async def cb_prefs_toggle(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id) and cb.from_user.id != cb.message.chat.id:
+        # Защита от чужих переключений в группах/форвардах
+        return await cb.answer("Недоступно", show_alert=True)
     logger.info("prefs toggle %s by user_id=%s", cb.data, cb.from_user.id)
     field = cb.data.split(":", 2)[2]
     prefs = await toggle_pref(cb.from_user.id, field)
@@ -522,7 +532,6 @@ async def cb_admin_stats(cb: CallbackQuery):
         unique_users = (await cur.fetchone())[0]
         await cur.execute("select count(distinct code) from public.entries")
         unique_codes = (await cur.fetchone())[0]
-        # Статистика подписок
         await cur.execute("select count(*) from public.user_prefs where notify_new_video = true")
         subs_video = (await cur.fetchone())[0]
         await cur.execute("select count(*) from public.user_prefs where notify_streams = true")
@@ -584,7 +593,7 @@ async def cmd_draw(message: types.Message) -> None:
         "🎉 <b>Победитель розыгрыша!</b>\n"
         f"Игрок: <b>{winner['first_name']}</b> ({uname})\n"
         f"ID участника: <code>{winner['participant_code']}</code>\n"
-        f"Найдено кодов: <b>{winner['codes_count']}</b> (вес)\n"
+        f"Найдено кодов: <b>{winner['codes_count']}</b>\n"
         f"Коды: {codes_list}"
     )
     await message.answer(text)
@@ -601,7 +610,7 @@ async def cb_admin_draw(cb: CallbackQuery):
         if not winner:
             return await cb.message.answer("Пока нет участников для розыгрыша.")
         uname = f"@{winner['username']}" if winner["username"] else f"user_id={winner['user_id']}"
-        codes_list = ", ".join(winner["codes"]) if winner["codes"]else "—"
+        codes_list = ", ".join(winner["codes"]) if winner["codes"] else "—"
         text = (
             "🎉 <b>Победитель розыгрыша!</b>\n"
             f"Игрок: <b>{winner['first_name']}</b> ({uname})\n"
@@ -679,8 +688,7 @@ async def _send_broadcast(btype: str, text: str, admin_chat_id: int):
     logger.info("broadcast start type=%s recipients=%s", btype, len(subs))
     for uid in subs:
         try:
-            # Превью ссылок глобально отключены через DefaultBotProperties
-            await bot.send_message(uid, text)
+            await bot.send_message(uid, text)  # превью отключено глобально
             sent += 1
         except Exception as e:
             failed += 1
@@ -754,40 +762,7 @@ async def handle_code(message: types.Message) -> None:
         )
 
 
-@dp.callback_query(F.data.startswith("subchk:"))
-async def cb_check_sub(cb: CallbackQuery):
-    await cb.answer("Проверяю…")
-    code_lc = cb.data.split(":", 1)[1]
-    valid_codes = [c.lower() for c in config.VALID_CODES]
-    if code_lc not in valid_codes:
-        return await cb.message.answer("Кодовое слово устарело или неверно.")
-
-    if not await is_subscribed(cb.from_user.id):
-        logger.info("sub check: still not subscribed user_id=%s", cb.from_user.id)
-        await cb.message.answer(
-            "Ты ещё не подписан. Подпишись и жми «✅ Подписался, проверить».",
-            reply_markup=not_subscribed_kb(code_lc),
-        )
-        return
-
-    entry_number, is_new, pcode = await register_entry(
-        user_id=cb.from_user.id,
-        username=cb.from_user.username,
-        first_name=cb.from_user.first_name,
-        code=code_lc,
-    )
-    if is_new:
-        logger.info("sub check: added after subscribe user_id=%s code=%s", cb.from_user.id, code_lc)
-        await cb.message.answer(
-            f"Отлично! Подписка есть ✅\nТвой ID: <code>{pcode}</code>\nТы участник №{entry_number} в розыгрыше."
-        )
-    else:
-        await cb.message.answer(
-            f"Подписка подтверждена ✅\nЭтот код уже был за тобой как №{entry_number}.\nТвой ID: <code>{pcode}</code>"
-        )
-
-
-# WEBHOOK / POLLING
+# ---------- ВЕБХУК ----------
 WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/webhook")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "change-me")
@@ -839,7 +814,6 @@ def create_app() -> web.Application:
             data = await request.json()
         except Exception:
             return web.Response(status=400, text="bad json")
-        # мгновенный ответ + обработка в фоне
         asyncio.create_task(_process_update_async(data))
         return web.Response(text="ok")
 

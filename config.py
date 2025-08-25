@@ -1,11 +1,10 @@
 import os
 import re
 
-# 🔑 Токен бота
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+# 🔑 Токен бота (ENV: BOT_TOKEN)
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
-# 👑 Админы
-# ADMIN_IDS="1,2,3" или ADMIN_ID="1"
+# 👑 Админы (ENV: ADMIN_IDS="111,222,333")
 _admins_raw = (os.getenv("ADMIN_IDS") or os.getenv("ADMIN_ID") or "").strip()
 ADMIN_IDS = sorted({
     int(x)
@@ -13,21 +12,9 @@ ADMIN_IDS = sorted({
     if x.strip().lstrip("-").isdigit()
 })
 
-# 🗃 Старый SQLite (для совместимости; не используется в текущем боте)
-DB_NAME = os.getenv("DB_NAME", "participants.db")
-
-# 🌐 PostgreSQL (Supabase). Порт 6543 — Transaction Pooler.
-DATABASE_URL = (os.getenv(
-    "DATABASE_URL",
-    "postgresql://postgres:Energizer_776GF4_SUPABASE@db.foptoqqcyjlbcwpwtecc.supabase.co:6543/postgres?sslmode=require",
-) or "").strip()
-
-# Для совместимости с кодом
-DB_URL = DATABASE_URL
-
-# 📢 Необязательная группа для анонса победителя
-_group_id = os.getenv("GROUP_CHAT_ID")
-GROUP_CHAT_ID = int(_group_id) if _group_id and _group_id.strip().lstrip("-").isdigit() else None
+# 🌐 PostgreSQL (Supabase) — обязательно в ENV: DATABASE_URL
+DATABASE_URL = (os.getenv("DATABASE_URL") or "").strip()
+DB_URL = DATABASE_URL  # алиас
 
 # ✅ Допустимые кодовые слова
 VALID_CODES = [
