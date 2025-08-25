@@ -12,13 +12,14 @@ from io import StringIO
 from collections import defaultdict
 import socket
 from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
-from typing import Dict, List, Tuple
+from typing import Dict, List
 
 # Windows: нужна эта политика для psycopg async
 if sys.platform.startswith("win"):
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 from aiogram import Bot, Dispatcher, types, F
+from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import Command
 from aiogram.types import (
     BotCommand,
@@ -46,7 +47,11 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(na
 logger = logging.getLogger("prizes-bot")
 
 dp = Dispatcher(storage=MemoryStorage())
-bot = Bot(token=config.BOT_TOKEN, parse_mode="HTML")
+# ✅ Новый способ: default=DefaultBotProperties(...)
+bot = Bot(
+    token=config.BOT_TOKEN,
+    default=DefaultBotProperties(parse_mode="HTML", link_preview_is_disabled=True),
+)
 
 PART_LEN = config.PARTICIPANT_CODE_LEN
 ALPHABET = config.PARTICIPANT_CODE_ALPHABET
@@ -461,7 +466,7 @@ async def cmd_start(message: types.Message) -> None:
         f"Твой постоянный ID участника: <code>{pcode}</code>\n"
         "Команды: /my — твои коды, /prefs — уведомления."
     )
-    await message.answer(text, disable_web_page_preview=True)
+    await message.answer(text)
 
 
 @dp.message(Command("my"))
@@ -517,7 +522,7 @@ async def cb_admin_stats(cb: CallbackQuery):
         unique_users = (await cur.fetchone())[0]
         await cur.execute("select count(distinct code) from public.entries")
         unique_codes = (await cur.fetchone())[0]
-        # Новое: статистика подписок на уведомления
+        # Статистика подписок
         await cur.execute("select count(*) from public.user_prefs where notify_new_video = true")
         subs_video = (await cur.fetchone())[0]
         await cur.execute("select count(*) from public.user_prefs where notify_streams = true")
@@ -596,7 +601,7 @@ async def cb_admin_draw(cb: CallbackQuery):
         if not winner:
             return await cb.message.answer("Пока нет участников для розыгрыша.")
         uname = f"@{winner['username']}" if winner["username"] else f"user_id={winner['user_id']}"
-        codes_list = ", ".join(winner["codes"]) if winner["codes"] else "—"
+        codes_list = ", ".join(winner["codes"]) if winner["codes"]else "—"
         text = (
             "🎉 <b>Победитель розыгрыша!</b>\n"
             f"Игрок: <b>{winner['first_name']}</b> ({uname})\n"
@@ -653,7 +658,6 @@ async def broadcast_collect_text(message: types.Message, state: FSMContext):
     await message.answer(
         f"Тип: <b>{kind_label}</b>\nПолучателей: <b>{len(subs)}</b>\n\nПредпросмотр:\n{text}",
         reply_markup=kb.as_markup(),
-        disable_web_page_preview=True,
     )
 
 
@@ -675,8 +679,8 @@ async def _send_broadcast(btype: str, text: str, admin_chat_id: int):
     logger.info("broadcast start type=%s recipients=%s", btype, len(subs))
     for uid in subs:
         try:
-            # ВАЖНО: отключаем превью ссылок
-            await bot.send_message(uid, text, disable_web_page_preview=True)
+            # Превью ссылок глобально отключены через DefaultBotProperties
+            await bot.send_message(uid, text)
             sent += 1
         except Exception as e:
             failed += 1
@@ -729,7 +733,7 @@ async def handle_code(message: types.Message) -> None:
     if not await is_subscribed(message.from_user.id):
         logger.info("not subscribed user_id=%s", message.from_user.id)
         await ensure_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
-        await message.answer(UNSUB_TEXT, reply_markup=not_subscribed_kb(code_lc), disable_web_page_preview=True)
+        await message.answer(UNSUB_TEXT, reply_markup=not_subscribed_kb(code_lc))
         return
 
     entry_number, is_new, pcode = await register_entry(
@@ -763,7 +767,6 @@ async def cb_check_sub(cb: CallbackQuery):
         await cb.message.answer(
             "Ты ещё не подписан. Подпишись и жми «✅ Подписался, проверить».",
             reply_markup=not_subscribed_kb(code_lc),
-            disable_web_page_preview=True
         )
         return
 
